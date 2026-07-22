@@ -1,27 +1,88 @@
-# 🧠 VMM Orchestrator – Use Case Example
+# 🧠 VMM Orchestrator
 
-This document explains how to use the **VMM Orchestrator** script to build, manage, and automate lab topologies in a QPOD environment.
-
----
-
-## ⚙️ Supported VM Types
-
-| VM Type | Role | Example Image | Interface Pattern | Disk Variable |
-|----------|------|----------------|------------------|---------------|
-| `vmx` | Routing | `junos-virtual-x86-64-23.4R2-S3.9.vmdk` | `ge-0/0/<*>` | `vmx_disk<*>` |
-| `vrouter` | Routing | `vJunos-router-24.2R2-S1.6.qcow2` | `ge-0/0/<*>` | `VROUTER_DISK<*>` |
-| `vswitch` | Switching | `vJunos-switch-24.2R2-S1.6.qcow2` | `ge-0/0/<*>` | `VSWITCH_DISK<*>` |
-| `vptx` | Routing | `junos-virtual-x86-64-23.4R2-S3.9.vmdk` | `et-0/0/<*>:<*>` | `vptx_disk<*>` |
-| `vscapa` | EVO | `junos-evo-install-ptx-x86-64-23.4R2-S1.7-EVO.iso` | `et-0/0/<*>` | `vscapa_disk<*>` |
-| `server` | Linux host | `ubuntu-22.04.qcow2` | `em<*>` | `server_disk<*>` |
-| `sniffer` | Traffic capture | `ubuntu-22.04.qcow2` | `eth<*>` | `sniffer_disk<*>` |
-| `vqfx` | Switching | `jinstall-vqfx-10-f-21.3R3.10.img` | `xe-0/0/<*>` | `vqfx_disk` |
+Build, deploy and configure multi-vendor Junos lab topologies on a QPOD from a
+single YAML file. You describe the devices and links in `topo.yml`; the
+orchestrator generates the VMM config, starts the lab, waits for the devices to
+boot, and applies a per-type baseline over the serial console.
 
 ---
 
-## 🪜 Step 1: Prepare the Python Environment
+## What it does
 
-On your **QPOD**, create a virtual environment and install dependencies:
+Running `python3 vmm.py` executes four phases:
+
+1. **Generate configuration** – validate `topo.yml` and render `lab_topology.conf` from `lab_template.j2`.
+2. **Start the lab** – `vmm unbind` / `vmm config` / `vmm start`.
+3. **Wait for boot** – poll `vmm ping` until each device's routing engine is reachable.
+4. **Apply baseline** – open each device's serial console in parallel and push its baseline config (hostname, root auth, management, interface descriptions).
+
+At the end it prints a deployment summary with device states and management IPs.
+
+---
+
+## Files
+
+| File | Purpose |
+|------|---------|
+| `vmm.py` | The orchestrator. |
+| `lab_template.j2` | Jinja2 template that renders the VMM `.conf` from the topology. |
+| `topo.yml` | Your working topology (edit this). |
+| `topo_reference.yml` | **Reference catalogue of every VM type** with the compatibility matrix and per-type interface notes. Copy and trim it to start a new lab. |
+| `topo_valfaromeo.yml` | Standalone vAlfaRomeo + vFerrari lab. |
+| `topo_mixed.yml` | Example vMX + vFerrari + vAlfaRomeo lab. |
+| `lab_topology.conf` | Generated output (overwritten each run). |
+
+---
+
+## Supported VM types
+
+| Type | Role | Mgmt | Disk alias | Interfaces | Ordering rule |
+|------|------|------|-----------|-----------|---------------|
+| `server` | Linux host | em0 | `server_disk` | `em1`, `em2`, … | sequential from `em1` |
+| `sniffer` | Traffic capture | em0 | `sniffer_disk` | (spliced via `sniffer: true`) | — |
+| `vswitch` | Switching | fxp0 | `VSWITCH_DISK` | `ge-0/0/N` | sequential from 0 |
+| `vrouter` | Routing | fxp0 | `VROUTER_DISK` | `ge-0/0/N` | sequential from 0 |
+| `vqfx` | Switching | em0 | `vqfx_disk` | `xe-0/0/N` | sequential from 0 |
+| `vmx` | Routing | fxp0 | `vmx_disk` | multi-FPC catalogue (below) | any subset |
+| `vferrari` | Routing | fxp0 | `vferrari_disk` | `et-0/0/0` … `et-0/0/4` | any subset |
+| `valfaromeo` | Routing | em0 | `valfaromeo_disk` | `et-0/0/<0-3>:<0-3>` | any subset |
+| `vptx` | Routing | em0 | `vptx_disk` | `et-0/0/<port>:<0-3>` | combined index sequential from 0 |
+| `vscapa` | EVO | re0:mgmt-0 | `vscapa_disk` | `et-0/0/N` | **odd** N, sequential from 1 |
+| `vbrackla` | EVO | re0:mgmt-0 | `vbrackla_disk` | `et-1/0/N:0` | sequential from 0 |
+
+**vmx interface catalogue** (use any subset, in any order):
+
+```
+FPC0: ge-0/0/0-9, ge-0/1/0-9, xe-0/2/0-1, xe-0/3/0-1
+FPC1: xe-1/0/0-5:0-3      FPC2: xe-2/0/0-5:0-3
+FPC3: et-3/0/0-5          FPC5: xe-5/0/0-11        (no FPC4)
+```
+
+Disk aliases for `vmx`, `vqfx`, `vptx`, `vferrari` and `valfaromeo` **must start
+with the type name** — the template keys off that prefix. The management
+interface is set automatically per type; it is not something you edit in the
+topology.
+
+---
+
+## Compatibility
+
+Most types mix freely. Only these combinations are forbidden, because the
+profiles ship VMM macro headers that redefine the same macros with conflicting
+values:
+
+- `valfaromeo` **✗** `vptx` / `vscapa` / `vbrackla` — vAlfaRomeo ships its own `common.vptx.defs`.
+- `vscapa` **✗** `vbrackla` — conflicting EVO macro headers.
+
+`vmm.py` rejects an illegal mix during validation (Phase 1), before anything is
+deployed, and names the reason. The full matrix lives at the top of
+`topo_reference.yml`.
+
+---
+
+## Setup
+
+On the QPOD:
 
 ```bash
 pip3 install --user virtualenv --index-url https://pypi.org/simple
@@ -30,154 +91,158 @@ source venv/bin/activate
 pip3 install pyyaml jinja2 junos-eznc paramiko pexpect --index-url https://pypi.org/simple
 ```
 
-Copy the script files to your working directory:
-
-```bash
-(venv) $ ls
-lab_template.j2  topo.yml  vmm.py
-```
-
 ---
 
-## 🗺️ Step 2: Define the Topology (`topo.yml`)
+## Define a topology
 
-<p align="center">
-  <img src="topology.png" alt="VMM Orchestrator Lab Topology" width="700"/>
-</p>
-
-
-Example topology file:
+Start from `topo_reference.yml` — it contains every type with its interfaces
+documented inline and the compatibility matrix at the top. Copy it, delete what
+you don't need, and edit the rest. A topology has three sections:
 
 ```yaml
 lab_name: DEMO-LAB
 
 disks:
+  vmx_disk:     /vmm/data/base_disks/junos/vmx/junos-virtual-x86-64-23.4R2-S3.9.vmdk
   VROUTER_DISK: /vmm/data/base_disks/junos/vmx/vJunos-router-24.2R2-S1.6.qcow2
-  VSWITCH_DISK: /vmm/data/base_disks/junos/vex/vJunos-switch-24.2R2-S1.6.qcow2
-  vmx_disk: /vmm/data/base_disks/junos/vmx/junos-virtual-x86-64-23.4R2-S3.9.vmdk
-  server_disk: /vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2
-  vqfx_disk: /homes/mchitu/images/jinstall-vqfx-10-f-21.3R3.10.img
-  sniffer_disk: /vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2
-  vscapa_disk: /vmm/data/base_disks/junos/vevo/junos-evo-install-ptx-x86-64-23.4R2-S1.7-EVO.iso
-  vptx_disk: /vmm/data/base_disks/junos/vmx/junos-virtual-x86-64-23.4R2-S3.9.vmdk
+  server_disk:  /vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2
 
 vms:
+  - hostname: R1
+    type: vmx
+    disk: vmx_disk
+  - hostname: R2
+    type: vrouter
+    disk: VROUTER_DISK
   - hostname: server
     type: server
     disk: server_disk
     ncpus: 2
     memory: 2048
 
-  - hostname: Sw1
-    type: vswitch
-    disk: VSWITCH_DISK
-
-  - hostname: R1
-    type: vmx
-    disk: vmx_disk
-
-  - hostname: R2
-    type: vrouter
-    disk: VROUTER_DISK
-
-  - hostname: R3
-    type: vptx
-    disk: vptx_disk
-
-  - hostname: R4
-    type: vscapa
-    disk: vscapa_disk
-
-  - hostname: Sw2
-    type: vqfx
-    disk: vqfx_disk
-
-  - hostname: Sniffer
-    type: server
-    disk: sniffer_disk
-    ncpus: 4
-    memory: 2048
-
 links:
-  - endpoints: ["server:em1", "Sw1:ge-0/0/0"]
-  - endpoints: ["Sw1:ge-0/0/1", "R1:ge-0/0/0"]
-  - endpoints: ["R1:ge-0/0/1", "R3:et-0/0/0:0"]
-  - endpoints: ["R1:ge-0/0/2", "R2:ge-0/0/0"]
-    sniffer: true
-  - endpoints: ["R2:ge-0/0/1", "R4:et-0/0/1"]
-  - endpoints: ["R3:et-0/0/0:1", "R4:et-0/0/3"]
-  - endpoints: ["R4:et-0/0/5", "Sw2:xe-0/0/0"]
+  - endpoints: ["server:em1", "R1:ge-0/0/0"]
+  - endpoints: ["R1:ge-0/0/1", "R2:ge-0/0/0"]
+    sniffer: true                 # splice the Sniffer VM inline (P2P links only)
 ```
 
----
-
-## ▶️ Step 3: Run the Script
+Validate your edits without deploying anything:
 
 ```bash
-(venv) $ python3 vmm.py
+python3 vmm.py -t topo_reference.yml --config_file_only
 ```
-
-The script executes in phases:
-
-1. **Generate configuration**
-2. **Start lab**
-3. **Wait for VMs**
-4. **Apply baseline configurations**
-
-At completion, you’ll see a summary table with device states and IPs.
 
 ---
 
-## 🧩 Step 4: Check Lab Details
+## Run
 
 ```bash
-(venv) $ python3 vmm.py --lab_detail
+python3 vmm.py                       # default topo.yml
+python3 vmm.py -t topo_reference.yml # a specific topology
 ```
 
-Displays deployment summary and link mapping between devices.
+Useful flags:
+
+| Flag | Effect |
+|------|--------|
+| `-t, --topology FILE` | Topology file (default `topo.yml`). |
+| `-o, --output FILE` | Generated VMM config filename (default `lab_topology.conf`). |
+| `--config_file_only` | Validate + generate the `.conf` and exit (no deploy). |
+| `--lab_detail` | Print the deployment summary + link map and exit. |
+| `--config` | Enter config-management mode (get/push device configs). |
+| `--skip_boot_wait` | Skip the Phase 3 ping wait and go straight to configuration. |
+| `--boot_wait SECONDS` | Cap on the Phase 3 wait (default 900). |
+| `--debug` | Stream the full serial dialogue per device (use when a device looks stuck). |
 
 ---
 
-## 💾 Step 5: Get or Push Device Configurations
+## Inspect and manage
+
+Deployment summary at any time:
 
 ```bash
-(venv) $ python3 vmm.py --config
+python3 vmm.py --lab_detail
 ```
 
-Choose whether to **get** or **push** configurations to active Junos devices.
+Get or push device configs (over SSH/NETCONF):
 
-Example output:
-```
-✅ Configuration for R1 (10.52.39.148) saved to default-config/R1.conf
-✅ Configuration for R2 (10.52.49.193) saved to default-config/R2.conf
-...
+```bash
+python3 vmm.py --config
+# choose 'get' or 'push', then a folder name
+# ✅ Configuration for R1 (10.52.39.148) saved to default-config/R1.conf
 ```
 
 ---
 
-## 🔍 Step 6: Packet Capture at Sniffer
+## Packet capture (sniffer)
 
-On the Sniffer VM:
+Mark a **point-to-point** link with `sniffer: true` and the Sniffer VM is
+spliced in-line automatically. On the Sniffer:
 
 ```bash
 root@ubuntu:~# brctl show
 bridge name   bridge id           STP enabled  interfaces
 br1           8000.fe0ca71458f2   no           eth1
                                                 eth2
-
 root@ubuntu:~# tcpdump -i br1
-listening on br1, link-type EN10MB (Ethernet), snapshot length 262144 bytes
+```
+
+> The sniffer does **not** support LACP — only use it on P2P links.
+
+---
+
+## Environment overrides
+
+Credentials and helper-asset paths default to the original values but can be
+overridden so the tool is portable across pods and user accounts:
+
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `VMM_DEVICE_USER` | `root` | Login user for all Junos devices. |
+| `VMM_DEVICE_PASSWORD` | `Embe1mpls` | Root password set on / used to reach devices. |
+| `VMM_SCRIPTS_DIR` | `/homes/balinfilipga/scripts` | Base dir for helper scripts. |
+| `VMM_SNIFFER_SCRIPT` | `$VMM_SCRIPTS_DIR/br.sh` | Sniffer bridge script uploaded to the Sniffer VM. |
+
+```bash
+VMM_DEVICE_PASSWORD='MyLabPass' VMM_SCRIPTS_DIR=/homes/$USER/scripts python3 vmm.py
 ```
 
 ---
 
-## 🧾 Notes
+## How devices are configured
 
-- For optimal performance, ensure base images and disk paths are valid.
-- Use the latest Junos and Ubuntu images supported by your VMM platform.
-- `--lab_detail` and `--config` options can be used at any time after initial deployment.
+Every Junos device is configured over its **serial console** (`vmm serial -t
+<name>_RE`), not SSH — serial works even before the management interface has an
+address, so it never cuts off its own session. Each type's baseline lives in
+`vmm.py`:
 
-Sniffer does not support LACP! Use only P2P links for the Sniffer! 
+- `configure_vjunos_serial` — vrouter / vswitch
+- `configure_vmx_serial` — vmx, vFerrari, vAlfaRomeo (baseline selected via `VMX_BASELINE_LINES` / `VFERRARI_BASELINE_LINES` / `VALFAROMEO_BASELINE_LINES`)
+- `configure_vptx_serial`, `configure_vscapa_serial`, `configure_vbrackla_serial`
+- `configure_vqfx` — over telnet
+
+The vmx-family baseline is built by `_vmx_baseline()`. vmx keeps
+`set chassis fpc 3 pic 0 pic-mode 40G` (it has an FPC3); vFerrari and
+vAlfaRomeo drop it and vFerrari adds `set forwarding-options hyper-mode`.
+
+> If a device stalls in Phase 4, re-run with `--debug`. If you see repeated
+> `Login incorrect`, the root password baked into that image doesn't match
+> `VMM_DEVICE_PASSWORD` — set the env var accordingly.
+
+---
+
+## Adding a new VM type (developer note)
+
+A new type touches four places in `vmm.py` / `lab_template.j2`:
+
+1. **Validation** – add an interface pattern (and disk-alias / sequential rule) in `validate_topology()`; if it conflicts with another profile's headers, add an entry to `INCOMPATIBLE_TYPE_GROUPS`.
+2. **Template** – add a `CASE` block in `lab_template.j2` and gate any type-specific `#include`s on `'<type>' in types`.
+3. **Baseline + dispatch** – add a `configure_*` worker (or reuse one) and wire it into the Phase 4 dispatch in `main()`.
+4. **Docs** – add a row to the table above and a commented block in `topo_reference.yml`.
+
+Always validate against a **known-good hand-written VMM config** for the new
+type — diffing the rendered output against it is how the vFerrari / vAlfaRomeo
+templates were verified.
 
 ---
 

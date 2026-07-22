@@ -1,0 +1,151 @@
+# =====================================================================
+#  VMM ORCHESTRATOR - REFERENCE TOPOLOGY
+# =====================================================================
+# A catalogue of every supported VM type. Copy this file, delete what you
+# don't need, and edit the rest. As shipped it is a valid, deployable lab of
+# every type that can legally coexist; the two that cannot (vAlfaRomeo,
+# vBrackla) are provided as commented blocks with swap-in instructions.
+#
+# Validate any edits without deploying:
+#     python3 vmm.py -t topo_reference.yml --config_file_only
+#
+# ---------------------------------------------------------------------
+#  COMPATIBILITY MATRIX  (OK = may share a lab, X = cannot)
+# ---------------------------------------------------------------------
+#              server vswitc vroute  vmx  vferr valfa  vptx vscap vbrac  vqfx
+#   server       OK    OK    OK    OK    OK    OK    OK    OK    OK    OK
+#   vswitch      OK    OK    OK    OK    OK    OK    OK    OK    OK    OK
+#   vrouter      OK    OK    OK    OK    OK    OK    OK    OK    OK    OK
+#   vmx          OK    OK    OK    OK    OK    OK    OK    OK    OK    OK
+#   vferrari     OK    OK    OK    OK    OK    OK    OK    OK    OK    OK
+#   valfaromeo   OK    OK    OK    OK    OK    OK     X     X     X    OK
+#   vptx         OK    OK    OK    OK    OK     X    OK    OK    OK    OK
+#   vscapa       OK    OK    OK    OK    OK     X    OK    OK     X    OK
+#   vbrackla     OK    OK    OK    OK    OK     X    OK     X    OK    OK
+#   vqfx         OK    OK    OK    OK    OK    OK    OK    OK    OK    OK
+#
+#   The ONLY forbidden combinations (enforced by vmm.py at validation time):
+#     valfaromeo  X  vptx / vscapa / vbrackla
+#     vscapa      X  vbrackla
+#   Everything else mixes freely. 'sniffer' is a 'server' on sniffer_disk and
+#   is compatible with everything.
+#
+#   Disk aliases for vmx / vqfx / vptx / vferrari / valfaromeo MUST start with
+#   the type name - the template keys off that prefix.
+# =====================================================================
+
+lab_name: REFERENCE-LAB
+
+disks:
+  VROUTER_DISK:    /vmm/data/base_disks/junos/vmx/vJunos-router-24.2R2-S1.6.qcow2
+  VSWITCH_DISK:    /vmm/data/base_disks/junos/vex/vJunos-switch-24.2R2-S1.6.qcow2
+  vmx_disk:        /vmm/data/base_disks/junos/vmx/junos-virtual-x86-64-23.4R2-S3.9.vmdk
+  vqfx_disk:       /homes/mchitu/images/jinstall-vqfx-10-f-21.3R3.10.img
+  vptx_disk:       /vmm/data/base_disks/junos/vmx/junos-virtual-x86-64-23.4R2-S3.9.vmdk
+  vscapa_disk:     /vmm/data/base_disks/junos/vevo/junos-evo-install-ptx-x86-64-23.4R2-S1.7-EVO.iso
+  vferrari_disk:   /homes/balinfilipga/images/junos-virtual-x86-64-22.4R3-S4.5.vmdk
+  server_disk:     /vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2
+  sniffer_disk:    /vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2
+  # Only needed if you enable the commented vAlfaRomeo / vBrackla blocks:
+  valfaromeo_disk: /homes/balinfilipga/images/junos-virtual-x86-64-22.4R3-S4.5.vmdk
+  vbrackla_disk:   /vmm/data/base_disks/junos/vevo/junos-evo-install-ptx-x86-64-23.4R2-S1.7-EVO.iso
+
+vms:
+  - hostname: server
+    type: server
+    disk: server_disk
+    ncpus: 2
+    memory: 2048
+    # mgmt: em0 (automatic). Data interfaces: em1, em2, ... (start at em1)
+
+  - hostname: Sniffer
+    type: server
+    disk: sniffer_disk
+    ncpus: 4
+    memory: 2048
+    # A 'server' on sniffer_disk. Not wired directly - add 'sniffer: true' to
+    # a P2P link (no LACP) and it is spliced in-line automatically.
+
+  - hostname: Sw1
+    type: vswitch
+    disk: VSWITCH_DISK
+    # mgmt: fxp0. Interfaces: ge-0/0/0, ge-0/0/1, ...  (sequential from 0)
+
+  - hostname: R2
+    type: vrouter
+    disk: VROUTER_DISK
+    # mgmt: fxp0. Interfaces: ge-0/0/0, ge-0/0/1, ...  (sequential from 0)
+
+  - hostname: R1
+    type: vmx
+    disk: vmx_disk
+    # mgmt: fxp0. Fixed multi-FPC catalogue - use ANY subset, any order:
+    #   FPC0: ge-0/0/0-9, ge-0/1/0-9, xe-0/2/0-1, xe-0/3/0-1
+    #   FPC1: xe-1/0/0-5:0-3      FPC2: xe-2/0/0-5:0-3
+    #   FPC3: et-3/0/0-5          FPC5: xe-5/0/0-11     (no FPC4)
+
+  - hostname: PE2
+    type: vferrari
+    disk: vferrari_disk
+    # mgmt: fxp0. Interfaces (any subset, any order):
+    #   et-0/0/0  et-0/0/1  et-0/0/2  et-0/0/3  et-0/0/4
+
+  - hostname: Sw2
+    type: vqfx
+    disk: vqfx_disk
+    # mgmt: em0. Interfaces: xe-0/0/0, xe-0/0/1, ...  (sequential from 0)
+
+  - hostname: R3
+    type: vptx
+    disk: vptx_disk
+    # mgmt: em0. Interfaces: et-0/0/<port>:<subport>, subport 0-3.
+    # Combined index (port*4 + subport) must be sequential from 0:
+    #   et-0/0/0:0, et-0/0/0:1, et-0/0/0:2, et-0/0/0:3, et-0/0/1:0, ...
+
+  - hostname: R4
+    type: vscapa
+    disk: vscapa_disk
+    # mgmt: re0:mgmt-0. Interfaces: et-0/0/<N>, N = ODD, sequential from 1:
+    #   et-0/0/1, et-0/0/3, et-0/0/5, ...
+
+  # ==================================================================
+  #  MUTUALLY-EXCLUSIVE TYPES - see the matrix before enabling.
+  # ==================================================================
+  # --- vAlfaRomeo : conflicts with vptx, vscapa AND vbrackla ---------
+  # To use: delete R3 (vptx) and R4 (vscapa) above (and their links),
+  # and do not enable vBrackla.
+  #
+  #  - hostname: PE1
+  #    type: valfaromeo
+  #    disk: valfaromeo_disk
+  #    # mgmt: em0. Interfaces: et-0/0/<port>:<subport> (any subset, any order):
+  #    #   et-0/0/0:0 et-0/0/0:1 et-0/0/0:2 et-0/0/0:3
+  #    #   et-0/0/1:0 et-0/0/1:1 et-0/0/1:2 et-0/0/1:3
+  #    #   et-0/0/2:0 et-0/0/2:1 et-0/0/2:2 et-0/0/2:3
+  #    #   et-0/0/3:0 et-0/0/3:1 et-0/0/3:2 et-0/0/3:3
+  #
+  # --- vBrackla : conflicts with vscapa (and vAlfaRomeo) ------------
+  # To use: delete R4 (vscapa) above (and its links).
+  #
+  #  - hostname: R5
+  #    type: vbrackla
+  #    disk: vbrackla_disk
+  #    # mgmt: re0:mgmt-0. Interfaces: et-1/0/<n>:0 (sequential from 0):
+  #    #   et-1/0/0:0, et-1/0/1:0, et-1/0/2:0, ...
+
+# =====================================================================
+#  LINKS
+# =====================================================================
+# Each link joins two "hostname:interface" endpoints on a shared bridge.
+# Interfaces must obey each type's rules commented above. Add 'sniffer: true'
+# to splice the Sniffer VM in-line on a P2P link.
+links:
+  - endpoints: ["server:em1", "Sw1:ge-0/0/0"]
+  - endpoints: ["server:em2", "R2:ge-0/0/0"]
+  - endpoints: ["Sw1:ge-0/0/1", "R2:ge-0/0/1"]
+    sniffer: true
+  - endpoints: ["R2:ge-0/0/2", "R1:ge-0/0/0"]
+  - endpoints: ["R1:xe-0/2/0", "PE2:et-0/0/0"]
+  - endpoints: ["PE2:et-0/0/1", "R3:et-0/0/0:0"]
+  - endpoints: ["R3:et-0/0/0:1", "R4:et-0/0/1"]
+  - endpoints: ["R4:et-0/0/3", "Sw2:xe-0/0/0"]

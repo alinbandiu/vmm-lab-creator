@@ -10,6 +10,7 @@ import re
 import os
 import logging
 import pexpect
+import functools
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from jnpr.junos import Device
@@ -29,6 +30,109 @@ logging.basicConfig(
     level=logging.CRITICAL + 1,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+# -----------------------------
+# Deployment constants
+# -----------------------------
+# Credentials applied to (and used to reach) every Junos device during
+# baseline configuration. Override with environment variables so the same
+# script works across different pods without editing the source.
+DEVICE_ROOT_USER = os.environ.get("VMM_DEVICE_USER", "root")
+DEVICE_ROOT_PASSWORD = os.environ.get("VMM_DEVICE_PASSWORD", "Embe1mpls")
+
+# Filesystem locations of helper assets on the QPOD. These default to the
+# original hardcoded paths but can be relocated via VMM_SCRIPTS_DIR (or the
+# per-file overrides) to make the tool portable to another user account.
+SCRIPTS_DIR = os.environ.get("VMM_SCRIPTS_DIR", "/homes/balinfilipga/scripts")
+SNIFFER_BRIDGE_SCRIPT = os.environ.get(
+    "VMM_SNIFFER_SCRIPT", os.path.join(SCRIPTS_DIR, "br.sh")
+)
+
+# -----------------------------
+# Multi-FPC VMX interface catalog
+# -----------------------------
+# Fixed hardware profile for the multi-FPC 'vmx' VM type: FPC0 (built-in GE/XE),
+# FPC1 & FPC2 (channelized 100G->4x25G, XE_CHAN), FPC3 (100G ports - these use the
+# XE_CHAN macro internally with a fixed subport of 0, but are exposed to Junos as
+# et-3/0/<port> rather than xe-3/0/<port>:0), and FPC5 (12x10GE, XE). FPC4 is not
+# present in this profile. This layout is fixed for every 'vmx' VM.
+FPC_I2CID_MACRO = {
+    0: 'VMX_MPC_I2CID',
+    1: 'VMX_EA_MPC_I2CID',
+    2: 'VMX_EA_MPC_I2CID',
+    3: 'VMX_EA_MPC_I2CID',
+    5: 'VMX_XL_MPC_I2CID',
+}
+
+def _build_vmx_interface_catalog():
+    catalog = {}
+    # FPC0: 20x GE (pic 0-1) + 4x XE (pic 2-3)
+    for pic in (0, 1):
+        for port in range(10):
+            catalog[f"ge-0/{pic}/{port}"] = {
+                'fpc': 0, 'pic': pic, 'port': port, 'subport': None, 'macro': 'GE'
+            }
+    for pic in (2, 3):
+        for port in range(2):
+            catalog[f"xe-0/{pic}/{port}"] = {
+                'fpc': 0, 'pic': pic, 'port': port, 'subport': None, 'macro': 'XE'
+            }
+    # FPC1 & FPC2: 6 ports x 4 channelized subports each
+    for fpc in (1, 2):
+        for port in range(6):
+            for sub in range(4):
+                catalog[f"xe-{fpc}/0/{port}:{sub}"] = {
+                    'fpc': fpc, 'pic': 0, 'port': port, 'subport': sub, 'macro': 'XE_CHAN'
+                }
+    # FPC3: 6x 100G ports, XE_CHAN macro with fixed subport 0, exposed as et-
+    for port in range(6):
+        catalog[f"et-3/0/{port}"] = {
+            'fpc': 3, 'pic': 0, 'port': port, 'subport': 0, 'macro': 'XE_CHAN'
+        }
+    # FPC5: 12x XE
+    for port in range(12):
+        catalog[f"xe-5/0/{port}"] = {
+            'fpc': 5, 'pic': 0, 'port': port, 'subport': None, 'macro': 'XE'
+        }
+    return catalog
+
+VMX_INTERFACE_CATALOG = _build_vmx_interface_catalog()
+
+def _vmx_catalog_hint():
+    """Human-readable summary of the valid multi-FPC vmx interface catalog,
+    generated from VMX_INTERFACE_CATALOG so it can't drift out of sync with
+    the code. Used in validation error messages."""
+    return (
+        "Valid vmx interfaces: ge-0/0/0-9, ge-0/1/0-9, xe-0/2/0-1, xe-0/3/0-1 (FPC0); "
+        "xe-1/0/0-5:0-3 (FPC1, channelized); xe-2/0/0-5:0-3 (FPC2, channelized); "
+        "et-3/0/0-5 (FPC3); xe-5/0/0-11 (FPC5). FPC4 is not available."
+    )
+
+# -----------------------------
+# Mutually exclusive VM types
+# -----------------------------
+# Each entry is (types_a, types_b, reason): no member of types_a may appear in
+# the same topology as any member of types_b, because their VMM macro headers
+# collide. Add a new entry here when a new profile brings its own conflicting
+# .defs file - the check in validate_topology() picks it up automatically.
+INCOMPATIBLE_TYPE_GROUPS = [
+    (
+        {'vscapa'}, {'vbrackla'},
+        "their macro headers (common.evovscapa.defs vs. "
+        "common.evovptx.defs/common.brackla.defs) redefine the same macros "
+        "with conflicting values, which makes 'vmm config' fail"
+    ),
+    (
+        {'valfaromeo'}, {'vptx', 'vscapa', 'vbrackla'},
+        "vAlfaRomeo ships its own common.vptx.defs "
+        "(/vmm/data/user_disks/dhahm/valfaromeo/) which defines the VPTX_* "
+        "chassis macros and IF_ET_CHAN differently from the standard "
+        "/vmm/data/vmm-configs/common/vmxc/common.vptx.defs. With both in one "
+        "file the wrong IF_ET_CHAN wins and VALFAROMEO_CONNECT emits an "
+        "invalid interface name such as 'VALFAROMEO_eth4'"
+    ),
+]
+
 # -----------------------------
 # Topology Validation Function
 # -----------------------------
@@ -42,12 +146,31 @@ def validate_topology(data):
     # Use a dictionary comprehension for quick VM lookup
     vms_by_hostname = {vm['hostname']: vm for vm in data.get('vms', [])}
 
+    # 0. Mutually Exclusive VM Type Check
+    # Several profiles ship VMM macro headers that #define the same macro
+    # names with conflicting values. Including two of them in one generated
+    # config makes 'vmm config' fail its preprocessing step (or, worse, expand
+    # to something invalid), so catch the combination here instead of letting
+    # it fail later on the VMM host.
+    present_types = {vm.get('type') for vm in data.get('vms', [])}
+    for group_a, group_b, reason in INCOMPATIBLE_TYPE_GROUPS:
+        hit_a = sorted(group_a & present_types)
+        hit_b = sorted(group_b & present_types)
+        if hit_a and hit_b:
+            errors.append(
+                f"Topology mixes {hit_a} with {hit_b}. These VM types cannot be "
+                f"used in the same lab: {reason}. Put them in separate topology "
+                f"files instead."
+            )
+
     # 1. Disk Naming Convention Check
     for vm in data.get('vms', []):
         vm_type = vm.get('type')
         disk_alias = vm.get('disk')
-        if vm_type in ('vmx', 'vqfx', 'vptx'):
-            # Use a single check for all supported types
+        if vm_type in ('vmx', 'vqfx', 'vptx', 'vferrari', 'valfaromeo'):
+            # Use a single check for all supported types. The template keys off
+            # this prefix to decide how the '#define' is emitted, so it is not
+            # merely cosmetic.
             if not disk_alias.startswith(vm_type):
                 errors.append(f"VM '{vm['hostname']}' (type: {vm_type}) uses disk '{disk_alias}'. Disk alias must start with '{vm_type}'.")
 
@@ -55,11 +178,20 @@ def validate_topology(data):
     interface_patterns = {
         'vrouter': re.compile(r'^ge-0/0/\d+$'),
         'vswitch': re.compile(r'^ge-0/0/\d+$'),
-        'vmx': re.compile(r'^ge-0/0/\d+$'),
         'vqfx': re.compile(r'^xe-0/0/\d+$'),
         'server': re.compile(r'^em\d+$'),
         'vscapa': re.compile(r'^et-0/0/\d+$'),
-        'vptx' : re.compile(r'^et-0/0/\d+:[0-3]$') # vptx check: enforces et-0/0/PORT:SUB where SUB is 0-3
+        'vptx' : re.compile(r'^et-0/0/\d+:[0-3]$'), # vptx check: enforces et-0/0/PORT:SUB where SUB is 0-3
+        # vbrackla's IF_ET macro only takes fpc/pic/port (no subport arg), but
+        # the interface is actually exposed to Junos as et-1/0/<port>:0 - the
+        # subport is fixed at 0, never channelized further.
+        'vbrackla': re.compile(r'^et-1/0/\d+:0$'),
+        # vFerrari: 5 fixed 100G ports on FPC0, not channelized. Emitted as
+        # VMX_CONNECT(ET(fpc,pic,port,0), ...) - same macro family as vmx.
+        'vferrari': re.compile(r'^et-0/0/[0-4]$'),
+        # vAlfaRomeo: 4 ports x 4 channelized subports on FPC0. Emitted as
+        # VALFAROMEO_CONNECT(IF_ET_CHAN(fpc,pic,port,subport), ...).
+        'valfaromeo': re.compile(r'^et-0/0/[0-3]:[0-3]$'),
     }
     vm_interfaces = defaultdict(list)
 
@@ -71,7 +203,12 @@ def validate_topology(data):
                 hostname, iface_name = endpoint.split(':', 1)
                 if hostname in vms_by_hostname:
                     vm_type = vms_by_hostname[hostname].get('type')
-                    if vm_type in interface_patterns:
+                    if vm_type == 'vmx':
+                        # Multi-FPC vmx: interface must be part of the fixed
+                        # FPC0/1/2/3/5 catalog (sparse usage is expected).
+                        if iface_name not in VMX_INTERFACE_CATALOG:
+                            errors.append(f"Invalid interface '{iface_name}' for VMX '{hostname}'. {_vmx_catalog_hint()}")
+                    elif vm_type in interface_patterns:
                         if not interface_patterns[vm_type].match(iface_name):
                             errors.append(f"Invalid interface format '{iface_name}' for VM '{hostname}' (type: {vm_type}). Expected format like: '{interface_patterns[vm_type].pattern}'.")
                     vm_interfaces[hostname].append(iface_name)
@@ -91,6 +228,15 @@ def validate_topology(data):
             errors.append(f"Duplicate interface assignment found on VM '{hostname}'. Each interface can only be used once.")
             continue # Skip sequential check if duplicates found
 
+        # These types draw from a fixed hardware interface catalog rather than
+        # a growable range, so the sequential-numbering rule below does not
+        # apply - any subset of the valid interfaces may be used, in any order.
+        #   vmx        - see VMX_INTERFACE_CATALOG (sparse, multi-FPC)
+        #   vferrari   - et-0/0/0 .. et-0/0/4
+        #   valfaromeo - et-0/0/0:0 .. et-0/0/3:3
+        if vm_type in ('vmx', 'vferrari', 'valfaromeo'):
+            continue
+
         numbers = []
         is_vscapa = (vm_type == 'vscapa')
         is_vptx = (vm_type == 'vptx')
@@ -100,19 +246,28 @@ def validate_topology(data):
                 # vptx (et-0/0/PORT:SUB) - Combine PORT and SUB into a single index for sequencing
                 # Index = (Port Index * 4) + Sub-Interface Index (since 4 sub-interfaces: 0, 1, 2, 3)
                 for iface in ifaces:
-                    # Extracts components based on '/' and ':' delimiters
-                    parts = re.split(r'[/-:]', iface) 
+                    # Extracts components based on '-', '/' and ':' delimiters.
+                    # NB: the '-' must be first (or escaped) in the character
+                    # class - '[/-:]' is a *range* (/ 0x2F .. : 0x3A) that
+                    # matches every digit, which silently broke this check.
+                    parts = re.split(r'[-/:]', iface)
                     port = int(parts[3]) # The PORT number (e.g., 0 in et-0/0/0:0)
                     sub = int(parts[4])  # The SUB number (e.g., 0 in et-0/0/0:0)
                     
                     numbers.append(port * 4 + sub)
                 numbers.sort()
             
+            elif vm_type == 'vbrackla':
+                # vbrackla (et-1/0/PORT:0) - subport is always 0, so only the
+                # port index needs to be sequential. Strip the ":0" before
+                # converting to int.
+                numbers = sorted([int(iface.split('/')[-1].split(':')[0]) for iface in ifaces])
+
             elif vm_type in ['vrouter', 'vswitch', 'vmx', 'vqfx', 'vscapa']:
                 # Standard interfaces: extract the last number (the port index)
                 # Split by '/' and take the last element, then convert to int.
                 numbers = sorted([int(iface.split('/')[-1]) for iface in ifaces])
-            
+
             elif vm_type == 'server':
                 # Server interfaces: extract number after 'em'
                 numbers = sorted([int(iface[2:]) for iface in ifaces if iface.startswith('em')])
@@ -327,6 +482,26 @@ def generate_config(topology_file, output_file, quiet=False):
             except ValueError:
                 print(f"⚠️  Warning: Malformed endpoint in link '{endpoints}'. Skipping.", file=sys.stderr)
 
+    # --- Build FPC groupings for multi-FPC vmx VMs (consumed by lab_template.j2) ---
+    for vm in vms_by_hostname.values():
+        if vm.get('type') != 'vmx':
+            continue
+        fpc_map = defaultdict(list)
+        for iface in vm.get('interfaces', []):
+            catalog_entry = VMX_INTERFACE_CATALOG.get(iface['name'])
+            if not catalog_entry:
+                continue  # already flagged by validate_topology()
+            iface['macro'] = catalog_entry['macro']
+            iface['fpc'] = catalog_entry['fpc']
+            iface['pic'] = catalog_entry['pic']
+            iface['port'] = catalog_entry['port']
+            iface['subport'] = catalog_entry['subport']
+            fpc_map[catalog_entry['fpc']].append(iface)
+        vm['fpc_groups'] = [
+            {'fpc': fpc, 'i2cid_macro': FPC_I2CID_MACRO[fpc], 'interfaces': ifaces}
+            for fpc, ifaces in sorted(fpc_map.items())
+        ]
+
     # --- Build the comprehensive summary list for the output table ---
     sniffed_link_map = {m['link']: m['capture_point'] for m in capture_mappings}
     final_summary_mappings = []
@@ -365,148 +540,100 @@ def run_vmm_config(config_file):
     try:
         print("Perfoming VMM unbind")
         subprocess.run(["vmm", "unbind"],stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["vmm", "config", config_file, "-g", "vmm-default"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("Applying vmm config!")
-   # except (subprocess.CalledProcessError, FileNotFoundError) as e:
-     #   print(f"❌ Failed to apply VMM config: {e}", file=sys.stderr)
-      #  sys.exit(1)
+        subprocess.run(["vmm", "config", config_file, "-g", "vmm-default"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"❌ Failed to apply VMM config: {e}", file=sys.stderr)
+        sys.exit(1)
 
+    try:
         subprocess.run(["vmm", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         print("✅ VMM lab started!")
     except (subprocess.CalledProcessError, FileNotFoundError) as e:
         print(f"❌ Failed to start VMM lab: {e}", file=sys.stderr)
         sys.exit(1)
 # -----------------------------
-# Monitor VMs with vmm-ping
+# Monitor devices with 'vmm ping'
 # -----------------------------
-def monitor_vms(required_pings=25, timeout=900):
+def monitor_vms(devices, timeout=900, stall_timeout=60, poll_interval=5):
     """
-    Discovers VMs using 'vmm ip', then concurrently pings them until they are stable.
-    A VM is declared 'stable' after it has been reported as 'alive' for a set
-    number of consecutive checks. Displays a single-line progress bar.
-    
-    Args:
-        required_pings (int): Number of successful, consecutive pings required.
-        timeout (int): Time in seconds before the function gives up and exits.
+    Wait until the devices we are about to configure report 'alive' in
+    'vmm ping', then let Phase 4 proceed. `devices` is a list of
+    (hostname, vm_type); each is tracked by its RE / console name (the same
+    name that shows up in 'vmm ping' - PE1_RE, R4_RE0, R2, ...), so the
+    progress bar reflects the actual routing engines rather than every VM IP.
+
+    This is the boot gate: we only drive a serial console once its device is
+    reachable. It is still non-fatal, though - if a device never answers ping
+    (some REs never get a management address), the stall/timeout path reports
+    it and continues, and the serial login coaxes its own prompt.
     """
+    # Map each configurable device to the name it appears under in 'vmm ping'.
+    targets = {re_ping_name(host, vtype): host for host, vtype in devices}
 
-    # --- Nested Helper Function for Threading ---
-    def ping_worker(ip, progress_dict, lock):
-        """
-        Continuously pings a single IP and updates a shared dictionary with the
-        count of consecutive successful pings. This function is designed to be
-        run in a separate thread.
-        """
-        # Ping command for Linux: -c 1 (send 1 packet), -W 2 (wait 2s for reply)
-        command = ["ping", "-c", "1", "-W", "2",ip]
-
-        while progress_dict.get(ip, 0) < required_pings:
-            try:
-                # Run the ping command, hiding its output
-                result = subprocess.run(command, capture_output=True, check=False)
-                
-                # Use a lock to safely update the shared dictionary
-                with lock:
-                    if result.returncode == 0:
-                        # Successful ping: increment the streak
-                        progress_dict[ip] += 1
-                    else:
-                        # Failed ping: reset the streak
-                        progress_dict[ip] = 0
-            except Exception:
-                # In case of any other error, reset the streak
-                with lock:
-                    progress_dict[ip] = 0
-            
-            time.sleep(1) # Wait 1 second before the next ping
-
-    # --- Main Function Logic ---
     print("\n" + "="*50)
-    print(" ⏳ Phase 3: Waiting for VMs to become reachable")
+    print(" ⏳ Phase 3: Waiting for devices to become reachable")
     print("="*50)
 
-    # 1. Discover Target IPs using 'vmm ip'
-    print("📡 Waiting for VMs to boot'...")
-    target_ips = []
-    try:
-        result = subprocess.run(
-            ["vmm", "ip"],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        ip_pattern = re.compile(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b')
-        for line in result.stdout.strip().splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and ip_pattern.match(parts[1]):
-                target_ips.append(parts[1])
-                
-        if not target_ips:
-            print("✅ 'vmm ip' ran successfully but returned no IPs. Proceeding...")
-            return
-        
-        print(f"Lab consist of {len(target_ips)} VMs in total")
+    if not targets:
+        print("No configurable devices to wait for; proceeding.")
+        return
 
-    except FileNotFoundError:
-        print("❌ Error: 'vmm' command not found. Is it installed and in your PATH?", file=sys.stderr)
-        sys.exit(1)
-    except subprocess.CalledProcessError as e:
-        print(f"❌ Error: 'vmm ip' command failed with return code {e.returncode}:", file=sys.stderr)
-        print(e.stderr, file=sys.stderr)
-        sys.exit(1)
+    print(f"\U0001f4e1 Waiting for {len(targets)} routing engine(s) to boot: "
+          f"{', '.join(sorted(targets))}")
 
-    # 2. Set up and start pinging threads
-    progress_lock = threading.Lock()
-    progress_data = {ip: 0 for ip in target_ips}
-    
-    for ip in target_ips:
-        # The worker thread is given the target function, ip, and shared resources
-        thread = threading.Thread(
-            target=ping_worker,
-            args=(ip, progress_data, progress_lock),
-            daemon=True  # Allows main program to exit even if threads are running
-        )
-        thread.start()
-
-    # 3. Display progress and check for completion or timeout
+    total = len(targets)
     start_time = time.time()
-    total_ips = len(target_ips)
+    last_alive_count = -1
+    last_progress_time = start_time
+    bar_length = 40
+
+    def draw(alive_count):
+        pct = alive_count / total
+        filled = int(bar_length * pct)
+        bar = "█" * filled + "-" * (bar_length - filled)
+        sys.stdout.write(f"\r[{bar}] {alive_count}/{total} Booted ({pct:.0%})   ")
+        sys.stdout.flush()
+
+    def report_pending(header, pending):
+        print(header)
+        for name in sorted(pending):
+            print(f"   - {name}  (device {targets[name]})")
+        print("\n➡️  Continuing to the configuration phase for the devices that "
+              "are up; serial login will keep retrying the rest.")
 
     try:
         while True:
-            # Safely read the current progress from the shared dictionary
-            with progress_lock:
-                stable_count = sum(1 for count in progress_data.values() if count >= required_pings)
+            ping_map = get_vmm_ping_map()
+            alive = {name for name in targets if ping_map.get(name, "").lower() == "alive"}
+            draw(len(alive))
 
-            # Draw the progress bar
-            percentage = stable_count / total_ips
-            bar_length = 40
-            filled_length = int(bar_length * percentage)
-            bar = "█" * filled_length + "-" * (bar_length - filled_length)
-            
-            sys.stdout.write(f"\r[{bar}] {stable_count}/{total_ips} Booted ({percentage:.0%})   ")
-            sys.stdout.flush()
-
-            # Check for success condition
-            if stable_count == total_ips:
-                print("\n\n✅ Devices booted up, checking reachabilty....!")
+            if len(alive) == total:
+                print("\n\n✅ All devices booted and reachable!")
                 return
-            
-            # Check for timeout condition
-            if time.time() - start_time > timeout:
-                print(f"\n\n⏰ Timeout reached ({timeout}s). The following IPs did not stabilize:")
-                with progress_lock:
-                    for ip, count in sorted(progress_data.items()):
-                        if count < required_pings:
-                            print(f"   - {ip} (Ping Streak: {count}/{required_pings})")
-                sys.exit(1)
 
-            time.sleep(1) # Update the progress bar every second
+            if len(alive) != last_alive_count:
+                last_alive_count = len(alive)
+                last_progress_time = time.time()
+
+            pending = set(targets) - alive
+            if alive and (time.time() - last_progress_time) > stall_timeout:
+                report_pending(
+                    f"\n\n⏳ No further progress for {stall_timeout}s "
+                    f"({len(alive)}/{total} reachable). Still waiting on:", pending)
+                return
+
+            if time.time() - start_time > timeout:
+                report_pending(
+                    f"\n\n⏰ Timeout reached ({timeout}s). Not reachable:", pending)
+                return
+
+            time.sleep(poll_interval)
 
     except KeyboardInterrupt:
-        print("\n\n🛑 Monitoring stopped by user.", file=sys.stderr)
+        print("\n\n\U0001f6d1 Monitoring stopped by user.", file=sys.stderr)
         sys.exit(1)
+
 
 # -----------------------------
 # Resolve hostname to IP
@@ -546,6 +673,11 @@ def get_vmx_nodes():
             name, host, port = parts[0], parts[1], int(parts[2])
             ip = resolve_ip(host)
             base_name = name.split("_RE")[0]
+            # vBrackla's chassis is named "{hostname}-vBrackla" (see
+            # PTX_CHAS_NAME in lab_template.j2), so strip that suffix too to
+            # resolve back to the plain topo.yml hostname.
+            if base_name.endswith("-vBrackla"):
+                base_name = base_name[: -len("-vBrackla")]
             nodes_info.append((base_name, ip, port))
             #print(f"   - Found node: {name} (as {base_name}) at {ip}:{port}")
     
@@ -553,6 +685,127 @@ def get_vmx_nodes():
         print("❌ Error: 'vmm serial' returned no configurable nodes.", file=sys.stderr)
         sys.exit(1)
     return nodes_info
+# -----------------------------
+# Shared Junos serial-console helpers
+# -----------------------------
+# Every configure_*_serial() function below drives the same console
+# login/boot state machine before applying its type-specific baseline
+# commands. These helpers centralise that shared logic so adding a new VM
+# template only requires supplying a console name and a command list.
+
+def _spawn_serial_with_retry(cmd, name, debug=False, retries=15, delay=10):
+    """Spawn a pexpect serial session, retrying on EOF until the console is
+    ready. Returns the live child, or raises after `retries` attempts."""
+    for attempt in range(1, retries + 1):
+        try:
+            child = pexpect.spawn(cmd, encoding='utf-8', timeout=300)
+            if debug:
+                child.logfile_read = sys.stdout
+            return child
+        except pexpect.exceptions.EOF:
+            if debug:
+                print(f"[{name}] Serial not ready, retry {attempt}/{retries}...")
+            time.sleep(delay)
+    raise Exception(f"Serial console {name} not ready after {retries} attempts")
+
+
+def _junos_serial_login(child, name, spawn_fn, debug=False,
+                        boot_timeout=360, cli_timeout=600, nudge_interval=8):
+    """Log in over the serial console and leave the device at the
+    configuration-mode ('# ') prompt. Returns the (possibly re-spawned) child.
+
+    Done in two phases so the login handshake is atomic instead of being run
+    through a general match loop:
+
+      Phase A - reach a shell or CLI prompt, logging in as root if asked. The
+        login is handled explicitly: after sending the username we consume
+        forward to the 'Password:' prompt, so a re-printed 'login:' banner
+        (the console echoes one every time it receives a stray Enter) can't
+        make us send the username again and queue up junk - which previously
+        produced 'Login incorrect'.
+      Phase B - from that shell/CLI, step into configuration mode.
+
+    No up-front Enter burst: Phase 3 has already confirmed the device answers
+    'vmm ping', so it is booted and sitting at a prompt. We nudge with a single
+    Enter only when the console has actually gone quiet.
+
+    `cli_timeout` bounds the cli -> edit transition; `boot_timeout` bounds the
+    whole login. `nudge_interval` is how long to wait for output before
+    pressing Enter to elicit a prompt.
+    """
+    def dbg(msg):
+        if debug:
+            print(f"[{name}] {msg}")
+
+    deadline = time.time() + boot_timeout
+    child.sendline("")           # one gentle nudge
+    state = None                 # which shell/CLI prompt we landed on
+
+    # --- Phase A: log in, reach a shell or CLI prompt ---
+    while time.time() < deadline:
+        idx = child.expect([
+            "login:",            # 0
+            "Password:",         # 1
+            "Login incorrect",   # 2
+            r"%",                # 3  FreeBSD shell
+            r"root@[^\r\n]*# ",  # 4  Linux root shell
+            r">\s",              # 5  Junos operational mode
+            r"#\s",              # 6  already in configuration mode
+            pexpect.TIMEOUT,     # 7
+            pexpect.EOF,         # 8
+        ], timeout=nudge_interval)
+        dbg(f"phaseA idx={idx}")
+
+        if idx == 0:             # login: -> send user, then wait for Password:
+            child.sendline(DEVICE_ROOT_USER)
+            p = child.expect(["Password:", pexpect.TIMEOUT], timeout=15)
+            if p == 0:
+                child.sendline(DEVICE_ROOT_PASSWORD)
+        elif idx == 1:           # Password: on its own -> answer it
+            child.sendline(DEVICE_ROOT_PASSWORD)
+        elif idx == 2:           # Login incorrect -> a fresh login: will follow
+            dbg("login rejected, retrying")
+            time.sleep(1)
+        elif idx in (3, 4, 5, 6):
+            state = idx
+            break
+        elif idx == 7:           # quiet -> single Enter to elicit a prompt
+            child.sendline("")
+        elif idx == 8:           # EOF -> re-spawn and re-nudge
+            dbg("EOF, re-spawning console")
+            child.close(force=True)
+            child = spawn_fn()
+            child.sendline("")
+    if state is None:
+        raise Exception(f"[{name}] could not reach a shell/CLI prompt within {boot_timeout}s "
+                        f"(check that the root password matches VMM_DEVICE_PASSWORD)")
+
+    # --- Phase B: shell/CLI -> configuration mode ---
+    if state in (3, 4):          # FreeBSD % or Linux root shell -> enter cli
+        child.sendline("cli")
+        child.expect(r">\s", timeout=cli_timeout)
+        child.sendline("edit")
+        child.expect(r"#\s", timeout=cli_timeout)
+    elif state == 5:             # Junos operational '>' -> edit
+        child.sendline("edit")
+        child.expect(r"#\s", timeout=cli_timeout)
+    # state == 6: already at '# '
+    dbg("reached configuration mode")
+    return child
+
+
+def _set_root_password(child, password=None):
+    """Handle the interactive 'set system root-authentication
+    plain-text-password' prompt sequence, returning to the '# ' prompt."""
+    if password is None:
+        password = DEVICE_ROOT_PASSWORD
+    child.sendline("set system root-authentication plain-text-password")
+    child.expect("New password:")
+    child.sendline(password)
+    child.expect(["Retype new password:", "Re-enter password:"])
+    child.sendline(password)
+    child.expect(r"# ")
+
 # -----------------------------
 # Configure a vrouter/vswitch
 # -----------------------------
@@ -563,71 +816,12 @@ def configure_vjunos_serial(name, interfaces, debug=False, retries=15, delay=10)
 
     cmd = f"vmm serial -t {name}"
 
-    # --- Spawn helper with retries ---
-    def spawn_with_retry():
-        for attempt in range(1, retries + 1):
-            try:
-                child = pexpect.spawn(cmd, encoding='utf-8', timeout=300)
-                if debug:
-                    child.logfile_read = sys.stdout
-                return child
-            except pexpect.exceptions.EOF:
-                if debug:
-                    print(f"[{name}] Serial not ready, retry {attempt}/{retries}...")
-                time.sleep(delay)
-        raise Exception(f"Serial console {name} not ready after {retries} attempts")
+    def spawn():
+        return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
 
     try:
-        child = spawn_with_retry()
-        child.sendline("")
-        time.sleep(1)
-
-        # --- Login / boot handling ---
-        max_boot_retries = 30
-        attempts = 0
-        while attempts < max_boot_retries:
-            attempts += 1
-            idx = child.expect([
-                "login:",
-                "Password:",
-                r"%",
-                r"root@.*# ",
-                r"> ",
-                r"# ",
-                pexpect.TIMEOUT,
-                pexpect.EOF
-            ], timeout=30)
-
-            if debug:
-                print(f"[{name}] idx={idx} matched={child.after.strip()!r}")
-
-            if idx == 0:  # login
-                child.sendline("root")
-            elif idx == 1:  # password
-                child.sendline("Embe1mpls")
-            elif idx == 2:  # FreeBSD shell %
-                child.sendline("cli")
-            elif idx == 3:  # Linux root shell
-                child.sendline("cli")
-                child.expect(r"> ")
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 4:  # Junos operational >
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 5:  # already in config mode
-                break
-            elif idx == 6:  # timeout
-                child.sendline("")
-            elif idx == 7:  # EOF
-                if debug:
-                    print(f"[{name}] EOF before config detected, retrying...")
-                child.close(force=True)
-                child = spawn_with_retry()
-        else:
-            raise Exception(f"[{name}] Could not reach config mode after {max_boot_retries} attempts")
+        child = spawn()
+        child = _junos_serial_login(child, name, spawn, debug=debug)
 
         # --- Helper to send commands ---
         def send_and_expect(cmd, prompt=r"# ", timeout=60):
@@ -640,12 +834,7 @@ def configure_vjunos_serial(name, interfaces, debug=False, retries=15, delay=10)
         send_and_expect(f"set system host-name {name}")
 
         # Root password
-        child.sendline("set system root-authentication plain-text-password")
-        child.expect("New password:")
-        child.sendline("Embe1mpls")
-        child.expect(["Retype new password:", "Re-enter password:"])
-        child.sendline("Embe1mpls")
-        child.expect(r"# ")
+        _set_root_password(child)
 
         # --- Configure interfaces descriptions ---
         for iface in interfaces:
@@ -701,71 +890,12 @@ def configure_vptx_serial(name, interfaces, debug=False, retries=15, delay=10):
 
     cmd = f"vmm serial -t {name}_RE"
 
-    # --- Spawn helper with retries ---
-    def spawn_with_retry():
-        for attempt in range(1, retries + 1):
-            try:
-                child = pexpect.spawn(cmd, encoding='utf-8', timeout=300)
-                if debug:
-                    child.logfile_read = sys.stdout
-                return child
-            except pexpect.exceptions.EOF:
-                if debug:
-                    print(f"[{name}] Serial not ready, retry {attempt}/{retries}...")
-                time.sleep(delay)
-        raise Exception(f"Serial console {name} not ready after {retries} attempts")
+    def spawn():
+        return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
 
     try:
-        child = spawn_with_retry()
-        child.sendline("")
-        time.sleep(1)
-
-        # --- Login / boot handling ---
-        max_boot_retries = 30
-        attempts = 0
-        while attempts < max_boot_retries:
-            attempts += 1
-            idx = child.expect([
-                "login:",
-                "Password:",
-                r"%",
-                r"root@.*# ",
-                r"> ",
-                r"# ",
-                pexpect.TIMEOUT,
-                pexpect.EOF
-            ], timeout=30)
-
-            if debug:
-                print(f"[{name}] idx={idx} matched={child.after.strip()!r}")
-
-            if idx == 0:  # login
-                child.sendline("root")
-            elif idx == 1:  # password
-                child.sendline("Embe1mpls")
-            elif idx == 2:  # FreeBSD shell %
-                child.sendline("cli")
-            elif idx == 3:  # Linux root shell
-                child.sendline("cli")
-                child.expect(r"> ")
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 4:  # Junos operational >
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 5:  # already in config mode
-                break
-            elif idx == 6:  # timeout
-                child.sendline("")
-            elif idx == 7:  # EOF
-                if debug:
-                    print(f"[{name}] EOF before config detected, retrying...")
-                child.close(force=True)
-                child = spawn_with_retry()
-        else:
-            raise Exception(f"[{name}] Could not reach config mode after {max_boot_retries} attempts")
+        child = spawn()
+        child = _junos_serial_login(child, name, spawn, debug=debug)
 
         # --- Helper to send commands ---
         def send_and_expect(cmd, prompt=r"# ", timeout=60):
@@ -778,12 +908,7 @@ def configure_vptx_serial(name, interfaces, debug=False, retries=15, delay=10):
         send_and_expect(f"set system host-name {name}")
 
         # Root password
-        child.sendline("set system root-authentication plain-text-password")
-        child.expect("New password:")
-        child.sendline("Embe1mpls")
-        child.expect(["Retype new password:", "Re-enter password:"])
-        child.sendline("Embe1mpls")
-        child.expect(r"# ")
+        _set_root_password(child)
 
         # --- Configure interfaces descriptions ---
         for iface in interfaces:
@@ -833,22 +958,22 @@ def configure_vqfx(name, ip, port, interfaces):
         tn = telnetlib.Telnet(ip, port, timeout=20)
         tn.write(b"\n\n"); time.sleep(1); tn.write(b"\n\n"); time.sleep(1)
         tn.read_until(b"login: ", timeout=10)
-        tn.write(b"root\n")
+        tn.write(DEVICE_ROOT_USER.encode('ascii') + b"\n")
         tn.read_until(b"Password:",timeout=5)
-        tn.write(b"Embe1mpls\n")
+        tn.write(DEVICE_ROOT_PASSWORD.encode('ascii') + b"\n")
         tn.read_until(b"% ", timeout=20)
         tn.write(b"cli\n")
         tn.read_until(b"> ", timeout=10)
         tn.write(b"edit\n")
         tn.read_until(b"# ", timeout=10)
-        
+
         tn.write(f"set system host-name {name}\n".encode('ascii'))
         tn.read_until(b"# ", timeout=10)
         tn.write(b"set system root-authentication plain-text-password\n")
         tn.read_until(b"New password: ", timeout=10)
-        tn.write(b"Embe1mpls\n")
+        tn.write(DEVICE_ROOT_PASSWORD.encode('ascii') + b"\n")
         tn.read_until(b"Retype new password: ", timeout=10)
-        tn.write(b"Embe1mpls\n")
+        tn.write(DEVICE_ROOT_PASSWORD.encode('ascii') + b"\n")
         tn.read_until(b"# ", timeout=10)
         tn.write(b"set interfaces em1 unit 0 family inet address 169.254.0.2/24\n")
         tn.read_until(b"# ", timeout=1)
@@ -892,143 +1017,151 @@ def configure_vqfx(name, ip, port, interfaces):
         print(f"❌ Failed to configure device {name} via Telnet. Error: {e}", file=sys.stderr)
         return f"Failure: {name} ({e})"
 # -----------------------------
-# Configure a VMX via Serial
+# Configure a VMX via Serial console
 # -----------------------------
+# Baseline configuration pushed to every vmx after boot. This replaces the
+# old vmx-default.cfg that the template used to drop onto the RE with an
+# 'install' statement: the device now boots with nothing but the lab's
+# inherited groups, and everything below is applied by vmm.py instead.
+#
+# Applied over the serial console rather than SSH: serial does not depend on
+# the management IP, DHCP, NETCONF or the inherited root password, so it stays
+# usable even while this very config is tearing the groups (and with them the
+# mgmt addressing) out from under the device.
+def _vmx_baseline(mgmt_iface="fxp0", include_fpc3_picmode=False):
+    """
+    Build the vmx-family baseline, parameterised by:
+      mgmt_iface          - 'fxp0' on vmx/vFerrari, 'em0' on vAlfaRomeo.
+      include_fpc3_picmode - only the multi-FPC 'vmx' profile has an FPC3, so
+                            'set chassis fpc 3 pic 0 pic-mode 40G' applies to
+                            vmx alone. vFerrari (single FPC0) and vAlfaRomeo
+                            (MX10008 FPC0) have no FPC3, and that line fails on
+                            commit for them.
+    """
+    chassis = [
+        "set chassis aggregated-devices ethernet device-count 10",
+    ]
+    if include_fpc3_picmode:
+        chassis.append("set chassis fpc 3 pic 0 pic-mode 40G")
+    chassis.append("set chassis network-services enhanced-ip")
 
-def configure_vmx_serial(name, interfaces, debug=False, retries=15, delay=10):
+    return [
+        "set system services netconf ssh",
+        "set system services ssh root-login allow",
+        "set system services ssh sftp-server",
+        "set system management-instance",
+        *chassis,
+        "set protocols lldp interface all",
+        f"set protocols lldp interface {mgmt_iface} disable",
+        # Management addressing. Required: 'delete groups' removes the mgmt
+        # address inherited from member0, so without this the RE ends up with
+        # no management config at all - it stays 'no-response' to 'vmm ping'
+        # and later SSH/NETCONF runs (--config get/push) cannot reach it.
+        f"set interfaces {mgmt_iface} unit 0 family inet dhcp",
+    ]
+
+
+# vmx has an FPC3 (multi-FPC profile); vFerrari and vAlfaRomeo do not.
+# vmx and vFerrari manage on fxp0; vAlfaRomeo manages on em0.
+VMX_BASELINE_LINES = _vmx_baseline("fxp0", include_fpc3_picmode=True)
+VALFAROMEO_BASELINE_LINES = _vmx_baseline("em0", include_fpc3_picmode=False)
+VFERRARI_BASELINE_LINES = _vmx_baseline("fxp0", include_fpc3_picmode=False) + [
+    # vFerrari-specific: required forwarding mode for this profile.
+    "set forwarding-options hyper-mode",
+]
+
+
+def configure_vmx_serial(name, interfaces, baseline=None, debug=False, retries=15, delay=10):
     """
-    Configures a vMX RE via serial console in serial mode.
-    Returns only success/failure.
-    Automatically retries if the serial console is not ready (EOF before config).
-    
-    Args:
-        name (str): Name of the RE (e.g., P1)
-        debug (bool): If True, prints all serial output and matched prompts
-        retries (int): Number of times to retry if the console is not ready
-        delay (int): Seconds to wait between retries
+    Configure a vmx-family device (vmx, vFerrari, vAlfaRomeo) over its serial
+    console. All three expose their RE as '{hostname}_RE' and take the same
+    baseline; `baseline` selects the variant (vAlfaRomeo manages on em0 rather
+    than fxp0, so it passes VALFAROMEO_BASELINE_LINES).
+
+    The vmx boots with only the lab's inherited groups (no vmx-default.cfg is
+    installed any more), so this applies the complete baseline in one commit:
+
+        delete apply-groups
+        delete groups
+        set system host-name <topo hostname>
+        set system root-authentication plain-text-password  (interactive)
+        <VMX_BASELINE_LINES>
+        set interfaces <ifd> description "..."   (one per link)
+        commit and-quit
+
+    Deleting the groups removes the inherited root-authentication and the fxp0
+    management address. Over serial neither matters: the root password is set
+    back interactively in the same session (so later SSH/NETCONF runs such as
+    --config still work), and fxp0 simply falls back to DHCP from
+    VMX_BASELINE_LINES without any risk of cutting off our own console.
     """
+    if baseline is None:
+        baseline = VMX_BASELINE_LINES
+
     cmd = f"vmm serial -t {name}_RE"
 
-    # --- Helper to spawn with retry ---
-    def spawn_with_retry():
-        for attempt in range(1, retries+1):
-            try:
-                child = pexpect.spawn(cmd, encoding='utf-8', timeout=300)
-                if debug:
-                    child.logfile_read = None  # replace None with sys.stdout to see full output
-                return child
-            except pexpect.exceptions.EOF:
-                if debug:
-                    print(f"[{name}] Serial not ready, retry {attempt}/{retries}...")
-                time.sleep(delay)
-        raise Exception(f"Serial console {name} not ready after {retries} attempts")
+    def spawn():
+        return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
+
+    # Tracks the last command sent so a TIMEOUT failure can report where it
+    # got stuck; defined before the try block so it's always safe to read.
+    last_command = "(spawning serial console)"
 
     try:
-        child = spawn_with_retry()
-        # Wake up the console
-        child.sendline("")
-        time.sleep(1)
-
-        # --- Boot/Login Handling ---
-        while True:
-            idx = child.expect([
-                "login:",
-                "Password:",
-                r"%",
-                r"root@.*# ",
-                r"> ",
-                r"# ",
-                pexpect.TIMEOUT,
-                pexpect.EOF
-            ], timeout=30)
-
-            if debug:
-                print(f"[{name}] idx={idx} matched={child.after.strip()!r}")
-
-            if idx == 0:  # login
-                child.sendline("root")
-            elif idx == 1:  # password
-                child.sendline("Embe1mpls")
-            elif idx == 2:  # FreeBSD shell %
-                child.sendline("cli")
-            elif idx == 3:  # root shell
-                child.sendline("cli")
-                child.expect(r"> ")
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 4:  # Junos operational >
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 5:  # already in config mode
-                break
-            elif idx == 6:  # timeout
-                child.sendline("")
-            elif idx == 7:  # EOF
-                if debug:
-                    print(f"[{name}] EOF before config detected, retrying...")
-                child.close(force=True)
-                child = spawn_with_retry()
+        child = spawn()
+        # A multi-FPC vmx can take much longer to become fully interactive
+        # (more MPCs to bring up), so allow a large cli_timeout.
+        last_command = "(login/boot sequence)"
+        child = _junos_serial_login(child, name, spawn, debug=debug, cli_timeout=600)
 
         # --- Helper to send commands ---
-        def send_and_expect(cmd, prompt=r"# "):
+        def send_and_expect(cmd, prompt=r"# ", timeout=60):
+            nonlocal last_command
+            last_command = cmd
             child.sendline(cmd)
-            child.expect(prompt, timeout=60)
+            child.expect(prompt, timeout=timeout)
             if debug:
                 print(f"[{name}] executed: {cmd}, matched: {child.after.strip()!r}")
 
-        # --- Configure system ---
+        # --- Drop the inherited lab groups ---
+        # apply-groups first, so nothing references the groups being removed.
+        send_and_expect("delete apply-groups")
+        send_and_expect("delete groups")
+
+        # --- Identity ---
         send_and_expect(f"set system host-name {name}")
 
-        # Interactive root password
-        child.sendline("set system root-authentication plain-text-password")
-        child.expect("New password:")
-        if debug: print(f"[{name}] matched: New password:")
-        child.sendline("Embe1mpls")
-        child.expect("Retype new password:")
-        if debug: print(f"[{name}] matched: Retype new password:")
-        child.sendline("Embe1mpls")
-        child.expect(r"# ")
+        # root-authentication is mandatory at commit time and was only
+        # provided by the deleted 'global' group, so set it back here. This
+        # also pins the password to DEVICE_ROOT_PASSWORD so the later
+        # SSH/NETCONF paths (--config get/push) can log in.
+        last_command = "set system root-authentication plain-text-password"
+        _set_root_password(child)
 
-        # Other configuration commands
-        commands = [
-            "delete groups",
-            "delete apply-groups",
-            "delete chassis auto-image-upgrade",
-            "set system services ssh root-login allow",
-            "set system services ssh sftp-server",
-            "set system services netconf ssh",
-            "set system management-instance",
-            "set routing-instances mgmt_junos",
-            "delete protocols router-advertisement",
-            "set protocols lldp interface all",
-            "set protocols lldp interface fxp0 disable",
-            "set chassis network-services enhanced-ip",
-            "set chassis aggregated-devices ethernet device-count 10",
-            "delete system processes dhcp-service",
-            "delete groups member0",
-            "set interfaces fxp0.0 family inet dhcp",
-        ]
-        for c in commands:
-            send_and_expect(c)
+        # --- Baseline ---
+        for line in baseline:
+            send_and_expect(line)
+
+        # --- Interface descriptions for the links defined in topo.yml ---
         for iface in interfaces:
-            desc_cmd = f"set interfaces {iface['name']} description \"{iface['description']}\""
-            send_and_expect(desc_cmd)   
-
+            send_and_expect(
+                f'set interfaces {iface["name"]} description "{iface["description"]}"'
+            )
 
         # --- Commit & detach ---
-        send_and_expect("commit and-quit", prompt=r"> ")
+        send_and_expect("commit and-quit", prompt=r"> ", timeout=300)
+        child.sendline("exit")
         child.close(force=True)
 
         return f"✅ Successfully configured {name}"
 
     except pexpect.exceptions.TIMEOUT:
-        return f"Failure: {name} (Timeout)"
+        return f"Failure: {name} (Timeout while waiting for: '{last_command}')"
     except pexpect.exceptions.EOF:
         return f"Failure: {name} (Connection Closed)"
     except Exception as e:
         return f"Failure: {name} ({e})"
+
 
 
 def configure_vscapa_serial(name, interfaces, debug=False, retries=15, delay=10):
@@ -1040,74 +1173,12 @@ def configure_vscapa_serial(name, interfaces, debug=False, retries=15, delay=10)
 
     cmd = f"vmm serial -t {name}_RE0"
 
-    # --- Spawn helper with retries ---
-    def spawn_with_retry():
-        for attempt in range(1, retries + 1):
-            try:
-                child = pexpect.spawn(cmd, encoding="utf-8", timeout=300)
-                if debug:
-                    child.logfile_read = sys.stdout
-                return child
-            except pexpect.exceptions.EOF:
-                if debug:
-                    print(f"[{name}] Serial not ready, retry {attempt}/{retries}...")
-                time.sleep(delay)
-        raise Exception(f"Serial console {name} not ready after {retries} attempts")
+    def spawn():
+        return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
 
     try:
-        child = spawn_with_retry()
-        child.sendline("")
-        time.sleep(1)
-
-        # --- Boot/Login Handling ---
-        max_boot_retries = 30
-        attempts = 0
-        while attempts < max_boot_retries:
-            attempts += 1
-            idx = child.expect(
-                [
-                    "login:",
-                    "Password:",
-                    r"%",
-                    r"root@.*# ",
-                    r"> ",
-                    r"# ",
-                    pexpect.TIMEOUT,
-                    pexpect.EOF,
-                ],
-                timeout=30,
-            )
-
-            if debug:
-                print(f"[{name}] idx={idx} matched={child.after.strip()!r}")
-
-            if idx == 0:  # login
-                child.sendline("root")
-            elif idx == 1:  # password
-                child.sendline("Embe1mpls")
-            elif idx == 2:  # FreeBSD shell %
-                child.sendline("cli")
-            elif idx == 3:  # Linux root shell
-                child.sendline("cli")
-                child.expect(r"> ")
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 4:  # Junos operational >
-                child.sendline("edit")
-                child.expect(r"# ")
-                break
-            elif idx == 5:  # Already in config mode
-                break
-            elif idx == 6:  # timeout
-                child.sendline("")
-            elif idx == 7:  # EOF
-                if debug:
-                    print(f"[{name}] EOF before config detected, retrying...")
-                child.close(force=True)
-                child = spawn_with_retry()
-        else:
-            raise Exception(f"[{name}] Could not reach config mode after {max_boot_retries} attempts")
+        child = spawn()
+        child = _junos_serial_login(child, name, spawn, debug=debug)
 
         # --- Helper to send commands ---
         def send_and_expect(cmd, prompt=r"# ", timeout=60):
@@ -1120,16 +1191,7 @@ def configure_vscapa_serial(name, interfaces, debug=False, retries=15, delay=10)
         send_and_expect(f"set system host-name {name}")
 
         # Root password (interactive)
-        child.sendline("set system root-authentication plain-text-password")
-        child.expect("New password:")
-        if debug:
-            print(f"[{name}] matched: New password:")
-        child.sendline("Embe1mpls")
-        child.expect(["Retype new password:", "Re-enter password:"])
-        if debug:
-            print(f"[{name}] matched: Retype/Re-enter password:")
-        child.sendline("Embe1mpls")
-        child.expect(r"# ")
+        _set_root_password(child)
 
         # --- Apply base config including DHCP on mgmt interface ---
         commands = [
@@ -1200,6 +1262,108 @@ def configure_vscapa_serial(name, interfaces, debug=False, retries=15, delay=10)
         return f"Failure: {name} ({e})"
 
 
+def configure_vbrackla_serial(name, interfaces, debug=False, retries=15, delay=10):
+    """
+    Connects to a vBrackla device via serial console and applies the same
+    baseline configuration as configure_vscapa_serial() (login, mgmt DHCP,
+    default route detection, interface descriptions, commit).
+
+    NOTE: the vBrackla chassis is named "{hostname}-vBrackla" in
+    lab_template.j2 (see PTX_CHAS_NAME), so unlike vscapa's "{name}_RE0",
+    the serial console here is assumed to be "{name}-vBrackla_RE0". If this
+    doesn't match reality, run 'vmm serial | grep -i <hostname>' to get the
+    exact console name and this line is the only one that needs adjusting.
+    """
+
+    cmd = f"vmm serial -t {name}-vBrackla_RE0"
+
+    def spawn():
+        return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
+
+    try:
+        child = spawn()
+        child = _junos_serial_login(child, name, spawn, debug=debug)
+
+        # --- Helper to send commands ---
+        def send_and_expect(cmd, prompt=r"# ", timeout=60):
+            child.sendline(cmd)
+            child.expect(prompt, timeout=timeout)
+            if debug:
+                print(f"[{name}] executed: {cmd}, matched: {child.after.strip()!r}")
+
+        # --- Configure system ---
+        send_and_expect(f"set system host-name {name}")
+
+        # Root password (interactive)
+        _set_root_password(child)
+
+        # --- Apply base config including DHCP on mgmt interface ---
+        commands = [
+            "delete groups",
+            "delete apply-groups",
+            "set system services ssh root-login allow",
+            "set system services ssh sftp-server",
+            "set system services netconf ssh",
+            "set system management-instance",
+            "set protocols lldp interface all",
+            "set protocols lldp interface re0:mgmt-0 disable",
+            "set chassis aggregated-devices ethernet device-count 10",
+            "set interfaces re0:mgmt-0.0 family inet dhcp",
+        ]
+        for c in commands:
+            send_and_expect(c)
+
+        for iface in interfaces:
+            desc_cmd = f"set interfaces {iface['name']} description \"{iface['description']}\""
+            send_and_expect(desc_cmd)
+
+        # --- First commit to apply base config ---
+        send_and_expect("commit", timeout=120)
+        time.sleep(35)  # adjust if needed based on lab speed
+        if debug:
+            print(f"[{name}] base config committed, waiting for mgmt interface to come up...")
+
+        # --- Wait for DHCP to populate ---
+
+        # Avoiding PR :1726785
+        gw_ip = None
+        max_gw_attempts = 25
+        for attempt in range(1, max_gw_attempts + 1):
+            time.sleep(5)
+            child.sendline('run show dhcp client binding detail | match "Name: routers, Value: "')
+            child.expect(r"# ", timeout=30)
+            output = child.before
+            if debug:
+                print(f"[{name}] DHCP binding output (attempt {attempt}):\n{output}")
+
+            gw_match = re.search(r"Name: routers, Value: (\d+\.\d+\.\d+\.\d+)", output)
+            if gw_match:
+                gw_ip = gw_match.group(1)
+                if debug:
+                    print(f"[{name}] detected gateway: {gw_ip}")
+                break
+
+        # --- Configure static route if gateway found ---
+        if gw_ip:
+            send_and_expect(f"set routing-instances mgmt_junos routing-options static route 0/0 next-hop {gw_ip}")
+            send_and_expect("commit", timeout=60)
+        else:
+            if debug:
+                print(f"[{name}] DHCP gateway info not found, skipping static route configuration")
+
+        # --- Exit config mode ---
+        child.sendline("exit")
+        child.close(force=True)
+
+        return f"✅ Successfully configured {name}"
+
+    except pexpect.exceptions.TIMEOUT:
+        return f"Failure: {name} (Timeout)"
+    except pexpect.exceptions.EOF:
+        return f"Failure: {name} (Connection Closed)"
+    except Exception as e:
+        return f"Failure: {name} ({e})"
+
 
 def upload_sniffer_script(capture_mappings):
     """
@@ -1238,7 +1402,7 @@ def upload_sniffer_script(capture_mappings):
         return f"Failure: {error_message}"
 
     # --- Step 4: Proceed with SSH, now that we have a valid IP ---
-    local_script_path = "/homes/balinfilipga/scripts/br.sh"
+    local_script_path = SNIFFER_BRIDGE_SCRIPT
     remote_script_path = "/root/br.sh"
 
     if not os.path.exists(local_script_path):
@@ -1247,7 +1411,7 @@ def upload_sniffer_script(capture_mappings):
     try:
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(sniffer_ip, username='root', password='Embe1mpls', timeout=20)
+        ssh.connect(sniffer_ip, username=DEVICE_ROOT_USER, password=DEVICE_ROOT_PASSWORD, timeout=20)
         
         sftp = ssh.open_sftp()
         sftp.put(local_script_path, remote_script_path)
@@ -1335,10 +1499,14 @@ def print_summary_table(topology_data):
         else:
             image_display = image_path
         
-        # vscapa, like vmx, has a _RE component that gets the IP
+        # The mgmt IP is reported against the RE component, whose name is
+        # type-specific: '{name}_RE' for vmx/vptx, '{name}_RE0' for vscapa,
+        # and '{name}-vBrackla_RE0' for vbrackla (see PTX_CHAS_NAME in the
+        # template). Everything else is keyed on the plain hostname.
         lookup_name = (
-        f"{name}_RE" if vm_type in ["vmx", "vptx"]
+        f"{name}_RE" if vm_type in ["vmx", "vptx", "vferrari", "valfaromeo"]
         else f"{name}_RE0" if vm_type == "vscapa"
+        else f"{name}-vBrackla_RE0" if vm_type == "vbrackla"
         else name)
         status = ping_data.get(lookup_name, {})
         state = status.get('state', 'unknown')
@@ -1431,7 +1599,7 @@ def get_config(ip, folder_name):
     """Fetches configuration from a device and saves it."""
     try:
         print(f"   - Connecting to {ip} to get config...")
-        dev = Device(host=ip, user='root', passwd='Embe1mpls')
+        dev = Device(host=ip, user=DEVICE_ROOT_USER, passwd=DEVICE_ROOT_PASSWORD)
         dev.open()
         hostname = dev.facts['hostname']
         config = dev.rpc.get_config(options={'format': 'text'})
@@ -1447,7 +1615,7 @@ def push_config(ip, folder_name):
     """Pushes a configuration file to a device."""
     try:
         print(f"   - Connecting to {ip} to push config...")
-        dev = Device(host=ip, user='root', passwd='Embe1mpls')
+        dev = Device(host=ip, user=DEVICE_ROOT_USER, passwd=DEVICE_ROOT_PASSWORD)
         dev.open()
         hostname = dev.facts['hostname']
         config_file = os.path.join(folder_name, f"{hostname}.conf")
@@ -1503,6 +1671,53 @@ def handle_config_management(topology_file):
             except Exception as exc:
                 print(f"A task generated an exception: {exc}")
 
+# Junos VM types that get a baseline pushed in Phase 4 (i.e. everything except
+# 'server'/'sniffer'). Used both to decide who to wait for in Phase 3 and who
+# to configure in Phase 4.
+CONFIGURABLE_TYPES = (
+    'vrouter', 'vswitch', 'vptx', 'vmx', 'vferrari', 'valfaromeo',
+    'vscapa', 'vbrackla', 'vqfx',
+)
+
+
+def configurable_devices(topology_data):
+    """Return [(hostname, vm_type), ...] for the VMs configured in Phase 4."""
+    return [
+        (vm['hostname'], vm['type'])
+        for vm in topology_data.get('vms', [])
+        if vm.get('type') in CONFIGURABLE_TYPES
+    ]
+
+
+# -----------------------------
+# Per-device boot gate (vmm ping)
+# -----------------------------
+def get_vmm_ping_map():
+    """Run 'vmm ping' and return {node_name: state} (e.g. {'PE1_RE': 'alive'})."""
+    try:
+        result = subprocess.run(["vmm", "ping"], capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return {}
+    ping_map = {}
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 3:
+            ping_map[parts[0]] = parts[2]
+    return ping_map
+
+
+def re_ping_name(host, vtype):
+    """The name a device's RE appears under in 'vmm ping' (see the RE naming in
+    lab_template.j2 and print_summary_table)."""
+    if vtype in ('vmx', 'vptx', 'vferrari', 'valfaromeo'):
+        return f"{host}_RE"
+    if vtype == 'vscapa':
+        return f"{host}_RE0"
+    if vtype == 'vbrackla':
+        return f"{host}-vBrackla_RE0"
+    return host
+
+
 # -----------------------------
 # Main workflow
 # -----------------------------
@@ -1514,6 +1729,16 @@ def main():
     parser.add_argument("--lab_detail", action="store_true", help="Display lab summary table and exit.")
     parser.add_argument("--config", action="store_true", help="Enter configuration management mode.")
     parser.add_argument("--config_file_only", action="store_true", help="Generate the VMM config file only and exit.")
+    parser.add_argument("--skip_boot_wait", action="store_true",
+                        help="Skip the Phase 3 ping wait entirely and go straight to configuration. "
+                             "Safe because devices are configured over the serial console, which "
+                             "has its own boot/login retry handling.")
+    parser.add_argument("--boot_wait", type=int, default=900, metavar="SECONDS",
+                        help="Hard cap on the Phase 3 ping wait (default: 900).")
+    parser.add_argument("--debug", action="store_true",
+                        help="Stream the full serial console dialogue for each device during "
+                             "Phase 4. Use this when a device appears stuck to see exactly where "
+                             "its login/commit is waiting.")
     args = parser.parse_args()
 
     if args.config_file_only:
@@ -1546,7 +1771,11 @@ def main():
     topology_data, final_summary_mappings, capture_mappings = generate_config(args.topology, args.output)
     run_vmm_config(args.output)
     
-    monitor_vms()
+    if args.skip_boot_wait:
+        print("\n⏭️  Skipping the boot wait (--skip_boot_wait); serial consoles "
+              "retry on their own until each device is ready.")
+    else:
+        monitor_vms(configurable_devices(topology_data), timeout=args.boot_wait)
 
 
     time.sleep(5)
@@ -1555,36 +1784,90 @@ def main():
     print(" 🔧 Phase 4: Applying Baseline Configuration")
     print("="*50) 
     print("**NOTE** This may take longer if using vSCAPA version that do not have fix for PR :1726785.\n")
-    telnet_nodes_info = get_vmx_nodes()
-    vms_by_hostname = {vm['hostname']: vm for vm in topology_data.get('vms', [])}   
+    # Serial-configured types build their own 'vmm serial -t <name>_RE'
+    # command, so they are dispatched straight from the topology - NOT from
+    # 'vmm serial' discovery. (Keying dispatch off discovery used to silently
+    # drop any device whose console name didn't split cleanly to its topology
+    # hostname, so it got no task and no error.)
+    SERIAL_WORKERS = {
+        'vrouter':  configure_vjunos_serial,
+        'vswitch':  configure_vjunos_serial,
+        'vptx':     configure_vptx_serial,
+        'vscapa':   configure_vscapa_serial,
+        'vbrackla': configure_vbrackla_serial,
+    }
+
+    # The vmx-family types all use configure_vmx_serial but each takes a
+    # slightly different baseline (fxp0 vs em0, FPC3 pic-mode only on vmx).
+    VMX_FAMILY_BASELINE = {
+        'vmx':        VMX_BASELINE_LINES,
+        'vferrari':   VFERRARI_BASELINE_LINES,
+        'valfaromeo': VALFAROMEO_BASELINE_LINES,
+    }
+
+    # vqfx is the only type configured over telnet, so it is the only one that
+    # needs its console host/port from 'vmm serial'. Only run that discovery
+    # (which aborts if it returns nothing) when the lab actually has a vqfx.
+    telnet_endpoints = {}
+    if any(vm.get('type') == 'vqfx' for vm in topology_data.get('vms', [])):
+        telnet_endpoints = {n: (ip, port) for n, ip, port in get_vmx_nodes()}
+
+    # Build the per-device plan up front so it can be shown before work starts.
+    # Each entry carries a zero-arg thunk with debug already bound; the serial
+    # workers all accept a `debug` kwarg (streams the console dialogue), vqfx
+    # does not.
+    debug = args.debug
+    plan = []          # (hostname, vtype, thunk)
+    skipped = []       # (hostname, vtype, reason)
+    for vm in topology_data.get('vms', []):
+        host = vm['hostname']
+        vtype = vm.get('type')
+        interfaces = vm.get('interfaces', [])
+        if vtype in VMX_FAMILY_BASELINE:
+            plan.append((host, vtype, functools.partial(
+                configure_vmx_serial, host, interfaces, VMX_FAMILY_BASELINE[vtype], debug=debug)))
+        elif vtype in SERIAL_WORKERS:
+            plan.append((host, vtype, functools.partial(
+                SERIAL_WORKERS[vtype], host, interfaces, debug=debug)))
+        elif vtype == 'vqfx':
+            ep = telnet_endpoints.get(host)
+            if ep:
+                plan.append((host, vtype, functools.partial(
+                    configure_vqfx, host, ep[0], ep[1], interfaces)))
+            else:
+                skipped.append((host, vtype, "no telnet console found via 'vmm serial'"))
+        else:
+            # server / sniffer have no Junos baseline applied in this phase.
+            skipped.append((host, vtype, "no serial baseline for this type"))
+
+    print(f"{len(plan)} device(s) to configure:")
+    for host, vtype, _ in plan:
+        print(f"   • {host} ({vtype})")
+    for host, vtype, reason in skipped:
+        print(f"   – {host} ({vtype}) skipped: {reason}")
+    if not debug:
+        print("(a device can take several minutes to boot; re-run with --debug to "
+              "watch the serial dialogue if one appears stuck)")
+
+    def _run(host, vtype, thunk):
+        # Phase 3 already waited for these devices to answer 'vmm ping', so
+        # just note the start (a slow console then shows as in-progress rather
+        # than looking like the whole run has hung).
+        print(f"🔧 [{host}] ({vtype}) connecting to serial console...")
+        return thunk()
+
     with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-
-        for name, ip, port in telnet_nodes_info:
-            vm = vms_by_hostname.get(name)
-            if vm and vm.get('type') in ['vrouter', 'vswitch']:
-                interfaces = vm.get('interfaces', [])
-                futures.append(executor.submit(configure_vjunos_serial, vm['hostname'], interfaces))
-            elif vm and vm.get('type') == 'vptx':
-                interfaces = vm.get('interfaces', [])
-                futures.append(executor.submit(configure_vptx_serial, vm['hostname'], interfaces))
-            elif vm and vm.get('type') == 'vmx':
-                interfaces = vm.get('interfaces', [])
-                futures.append(executor.submit(configure_vmx_serial, vm['hostname'], interfaces))
-            elif vm and vm.get('type') == 'vscapa':
-                interfaces = vm.get('interfaces', [])
-                futures.append(executor.submit(configure_vscapa_serial, vm['hostname'], interfaces))
-            elif vm and vm.get('type') == 'vqfx':
-                interfaces = vm.get('interfaces', [])
-                futures.append(executor.submit(configure_vqfx, name, ip, port, interfaces))                    
-
-        print(f"Starting {len(futures)} parallel configuration tasks...")
+        futures = {
+            executor.submit(_run, host, vtype, thunk): host
+            for host, vtype, thunk in plan
+        }
+        print(f"\nStarting {len(futures)} parallel configuration tasks...")
         for future in as_completed(futures):
+            host = futures[future]
             try:
-                result = future.result()
-                print(result)
+                print(future.result())
             except Exception as e:
-                print(f"An unexpected error occurred in a worker thread: {e}", file=sys.stderr)
+                print(f"❌ [{host}] unexpected error in worker thread: {e}", file=sys.stderr)
 
     print("\n🎉 All configuration tasks complete.")
     print_summary_table(topology_data)
