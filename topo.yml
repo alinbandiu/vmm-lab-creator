@@ -1,4 +1,50 @@
-lab_name: DEMO-LAB   
+lab_name: DEMO-LAB
+
+# =====================================================================
+#  VM TYPE COMPATIBILITY MATRIX
+# =====================================================================
+# Most VM types can be freely mixed in one lab. The exceptions below exist
+# because those profiles ship VMM macro headers that #define the same macro
+# names with different values - putting two of them in one generated config
+# makes 'vmm config' fail (or silently expand to something invalid).
+#
+# vmm.py enforces this during validation, so an illegal combination is
+# rejected up front rather than failing later on the VMM host.
+#
+#              server  vswitc  vroute     vmx  vferra  valfar    vptx  vscapa  vbrack    vqfx
+#  server          OK      OK      OK      OK      OK      OK      OK      OK      OK      OK
+#  vswitch         OK      OK      OK      OK      OK      OK      OK      OK      OK      OK
+#  vrouter         OK      OK      OK      OK      OK      OK      OK      OK      OK      OK
+#  vmx             OK      OK      OK      OK      OK      OK      OK      OK      OK      OK
+#  vferrari        OK      OK      OK      OK      OK      OK      OK      OK      OK      OK
+#  valfaromeo      OK      OK      OK      OK      OK      OK       X       X       X      OK
+#  vptx            OK      OK      OK      OK      OK       X      OK      OK      OK      OK
+#  vscapa          OK      OK      OK      OK      OK       X      OK      OK       X      OK
+#  vbrackla        OK      OK      OK      OK      OK       X      OK       X      OK      OK
+#  vqfx            OK      OK      OK      OK      OK      OK      OK      OK      OK      OK
+#
+# Only 4 combinations are forbidden:
+#
+#   valfaromeo X vptx
+#   valfaromeo X vscapa      vAlfaRomeo ships its own common.vptx.defs
+#   valfaromeo X vbrackla    (under /vmm/data/user_disks/dhahm/valfaromeo/)
+#                            which redefines the VPTX_* chassis macros and
+#                            IF_ET_CHAN. With the standard common.vptx.defs
+#                            also present the wrong IF_ET_CHAN wins and
+#                            VALFAROMEO_CONNECT emits a bad interface name
+#                            ('VALFAROMEO_eth4').
+#
+#   vscapa X vbrackla        common.evovscapa.defs vs.
+#                            common.evovptx.defs/common.brackla.defs
+#                            redefine the same macros with conflicting values.
+#
+# 'sniffer' is not a type - it is a 'server' VM whose disk alias is
+# 'sniffer_disk'; it is compatible with everything.
+#
+# This file uses 'vscapa' (R4), so it cannot also contain vbrackla or
+# valfaromeo. See topo_valfaromeo.yml for a standalone vAlfaRomeo +
+# vFerrari lab, and topo_mixed.yml for vMX + vFerrari + vAlfaRomeo.
+# =====================================================================
 
 disks:
 
@@ -8,60 +54,105 @@ disks:
   server_disk: /vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2
   vqfx_disk: /homes/mchitu/images/jinstall-vqfx-10-f-21.3R3.10.img
   sniffer_disk: /vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2
-  vscapa_disk: /vmm/data/base_disks/junos/vevo/junos-evo-install-ptx-x86-64-23.4R2-S1.7-EVO.iso 
+  vscapa_disk: /vmm/data/base_disks/junos/vevo/junos-evo-install-ptx-x86-64-23.4R2-S1.7-EVO.iso
   vptx_disk: /vmm/data/base_disks/junos/vmx/junos-virtual-x86-64-23.4R2-S3.9.vmdk
+  # Disk aliases MUST start with the VM type name for these types - the
+  # template keys off that prefix when emitting the '#define'.
+  #vferrari_disk: /homes/balinfilipga/images/junos-virtual-x86-64-22.4R3-S4.5.vmdk
+  #valfaromeo_disk: /homes/balinfilipga/images/junos-virtual-x86-64-22.4R3-S4.5.vmdk
 
 vms:
-#VM definition for a VMX 
-      - hostname: server 
+#VM definition for a VMX
+      - hostname: server
         type: server
         disk: server_disk
         ncpus: 2
         memory: 2048
+        #Interfaces em0, em1 ...
 
 
       - hostname: Sw1
         type: vswitch
         disk: VSWITCH_DISK
+        #Interfaces ge-0/0/0 to ge-0/0/11
 
       - hostname: R1
         type: vmx
         disk: vmx_disk
-  
+        # Supported vmx interfaces (fixed multi-FPC hardware profile - use any
+        # subset of these below in 'links:', unused ones are fine):
+        #   FPC0 (LU-CHIP):         ge-0/0/0-9, ge-0/1/0-9, xe-0/2/0-1, xe-0/3/0-1
+        #   FPC1 (EA 10G): xe-1/0/0-5:0-3
+        #   FPC2 (EA 10G): xe-2/0/0-5:0-3
+        #   FPC3 (EA 40G, ):      et-3/0/0-5
+        #   FPC5 (XL 10G):        xe-5/0/0-11
+        #   (FPC4 is not available on this profile)
+
       - hostname: R2
-        type: vrouter 
+        type: vrouter
         disk: VROUTER_DISK
+        #Interfaces ge-0/0/0 to ge-0/0/11
 
       - hostname: R3
-        type: vptx 
+        type: vptx
         disk: vptx_disk
+        # Interface are et, et-0/0/0:0-3 ---- et-0/0/11:0-3
 
       - hostname: R4
         type: vscapa
         disk: vscapa_disk
+        # Supported vscapa interfaces: et-0/0/<N> only, where N must be
+        # sequential ODD numbers starting at 1 (et-0/0/1, et-0/0/3, et-0/0/5, ...et-0/0/15).
+        # Even-numbered or non-sequential ports (e.g. et-0/0/2, or et-0/0/1
+        # followed by et-0/0/5 with nothing in between) will fail validation.
 
       - hostname: Sw2
         type: vqfx
         disk: vqfx_disk
+        #Interface xe-0/0/0 to xe-0/0/11
 
       - hostname: Sniffer
         type: server
-        disk: sniffer_disk 
+        disk: sniffer_disk
         ncpus: 4
         memory: 2048
-      
+
+# --- vFerrari -----------------------------------------------------------
+# Same device config as 'vmx' (management on fxp0). Single FPC0 with 5 fixed,
+# non-channelized 100G ports. Any subset may be used, in any order - there is
+# no sequential-numbering requirement.
+#
+#      - hostname: PE2
+#        type: vferrari
+#        disk: vferrari_disk
+#        # Supported vferrari interfaces:
+#        #   et-0/0/0
+#        #   et-0/0/1
+#        #   et-0/0/2
+#        #   et-0/0/3
+#        #   et-0/0/4
+#
+# --- vAlfaRomeo ---------------------------------------------------------
+# Same device config as 'vmx' EXCEPT the management interface is em0, not
+# fxp0. MX10008 chassis; FPC0 with 4 ports x 4 channelized subports. Any
+# subset may be used, in any order.
+#
+#      - hostname: PE1
+#        type: valfaromeo
+#        disk: valfaromeo_disk
+#        # Supported valfaromeo interfaces (et-0/0/<port>:<subport>):
+#        #   et-0/0/0:0   et-0/0/0:1   et-0/0/0:2   et-0/0/0:3
+#        #   et-0/0/1:0   et-0/0/1:1   et-0/0/1:2   et-0/0/1:3
+#        #   et-0/0/2:0   et-0/0/2:1   et-0/0/2:2   et-0/0/2:3
+#        #   et-0/0/3:0   et-0/0/3:1   et-0/0/3:2   et-0/0/3:3
+
 
 links:
-  - endpoints: ["server:em1", "Sw1:ge-0/0/0"]
-  - endpoints: ["Sw1:ge-0/0/1", "R1:ge-0/0/0"]
-  - endpoints: ["R1:ge-0/0/1", "R3:et-0/0/0:0"]
-  - endpoints: ["R1:ge-0/0/2", "R2:ge-0/0/0"]
-    sniffer: true 
-  - endpoints: ["R2:ge-0/0/1", "R4:et-0/0/1"]
-  - endpoints: ["R3:et-0/0/0:1", "R4:et-0/0/3"]
-  - endpoints: ["R4:et-0/0/5", "Sw2:xe-0/0/0"]
-
-
-
-
-
+  - endpoints: ["R1:ge-0/0/0", "R2:ge-0/0/0"]
+  - endpoints: ["R1:xe-0/2/0", "R2:ge-0/0/1"]
+  - endpoints: ["R1:xe-0/3/0", "R2:ge-0/0/2"]
+  - endpoints: ["R1:xe-1/0/0:0", "R2:ge-0/0/3"]
+  - endpoints: ["R1:xe-2/0/0:0", "R2:ge-0/0/4"]
+  - endpoints: ["R1:et-3/0/0", "R3:et-0/0/0:0"]
+  - endpoints: ["R1:et-3/0/1", "R3:et-0/0/0:1"]
+  - endpoints: ["R1:xe-5/0/0", "R3:et-0/0/0:2"]
