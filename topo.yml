@@ -134,17 +134,17 @@ vms:
 #
 # --- vAlfaRomeo ---------------------------------------------------------
 # Same device config as 'vmx' EXCEPT the management interface is em0, not
-# fxp0. MX10008 chassis; FPC0 with 4 ports x 4 channelized subports. Any
-# subset may be used, in any order.
+# fxp0. MX10008 chassis, up to TWO linecards (FPC0 and FPC1), each with 4
+# ports x 4 channelized subports. Any subset may be used, in any order.
+# Using an et-1/0/... interface adds the second linecard automatically.
 #
 #      - hostname: PE1
 #        type: valfaromeo
 #        disk: valfaromeo_disk
-#        # Supported valfaromeo interfaces (et-0/0/<port>:<subport>):
-#        #   et-0/0/0:0   et-0/0/0:1   et-0/0/0:2   et-0/0/0:3
-#        #   et-0/0/1:0   et-0/0/1:1   et-0/0/1:2   et-0/0/1:3
-#        #   et-0/0/2:0   et-0/0/2:1   et-0/0/2:2   et-0/0/2:3
-#        #   et-0/0/3:0   et-0/0/3:1   et-0/0/3:2   et-0/0/3:3
+#        # Supported valfaromeo interfaces: et-<fpc>/0/<port>:<subport>,
+#        # fpc 0-1, port 0-3, subport 0-3:
+#        #   FPC0: et-0/0/0:0 .. et-0/0/3:3
+#        #   FPC1: et-1/0/0:0 .. et-1/0/3:3
 
 
 links:

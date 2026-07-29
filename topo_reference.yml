@@ -118,11 +118,11 @@ vms:
   #  - hostname: PE1
   #    type: valfaromeo
   #    disk: valfaromeo_disk
-  #    # mgmt: em0. Interfaces: et-0/0/<port>:<subport> (any subset, any order):
-  #    #   et-0/0/0:0 et-0/0/0:1 et-0/0/0:2 et-0/0/0:3
-  #    #   et-0/0/1:0 et-0/0/1:1 et-0/0/1:2 et-0/0/1:3
-  #    #   et-0/0/2:0 et-0/0/2:1 et-0/0/2:2 et-0/0/2:3
-  #    #   et-0/0/3:0 et-0/0/3:1 et-0/0/3:2 et-0/0/3:3
+  #    # mgmt: em0. Interfaces et-<fpc>/0/<port>:<subport> (any subset, any
+  #    # order); fpc 0-1, port 0-3, subport 0-3. Using an et-1/... interface
+  #    # adds a second linecard (FPC1) automatically:
+  #    #   FPC0: et-0/0/0:0 .. et-0/0/3:3
+  #    #   FPC1: et-1/0/0:0 .. et-1/0/3:3
   #
   # --- vBrackla : conflicts with vscapa (and vAlfaRomeo) ------------
   # To use: delete R4 (vscapa) above (and its links).

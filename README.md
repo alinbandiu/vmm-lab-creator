@@ -45,7 +45,7 @@ At the end it prints a deployment summary with device states and management IPs.
 | `vqfx` | Switching | em0 | `vqfx_disk` | `xe-0/0/N` | sequential from 0 |
 | `vmx` | Routing | fxp0 | `vmx_disk` | multi-FPC catalogue (below) | any subset |
 | `vferrari` | Routing | fxp0 | `vferrari_disk` | `et-0/0/0` … `et-0/0/4` | any subset |
-| `valfaromeo` | Routing | em0 | `valfaromeo_disk` | `et-0/0/<0-3>:<0-3>` | any subset |
+| `valfaromeo` | Routing | em0 | `valfaromeo_disk` | `et-<0-1>/0/<0-3>:<0-3>` (FPC0 + FPC1) | any subset |
 | `vptx` | Routing | em0 | `vptx_disk` | `et-0/0/<port>:<0-3>` | combined index sequential from 0 |
 | `vscapa` | EVO | re0:mgmt-0 | `vscapa_disk` | `et-0/0/N` | **odd** N, sequential from 1 |
 | `vbrackla` | EVO | re0:mgmt-0 | `vbrackla_disk` | `et-1/0/N:0` | sequential from 0 |

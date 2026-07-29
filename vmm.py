@@ -189,9 +189,10 @@ def validate_topology(data):
         # vFerrari: 5 fixed 100G ports on FPC0, not channelized. Emitted as
         # VMX_CONNECT(ET(fpc,pic,port,0), ...) - same macro family as vmx.
         'vferrari': re.compile(r'^et-0/0/[0-4]$'),
-        # vAlfaRomeo: 4 ports x 4 channelized subports on FPC0. Emitted as
-        # VALFAROMEO_CONNECT(IF_ET_CHAN(fpc,pic,port,subport), ...).
-        'valfaromeo': re.compile(r'^et-0/0/[0-3]:[0-3]$'),
+        # vAlfaRomeo: 4 ports x 4 channelized subports per FPC, on FPC0 and
+        # FPC1. Emitted as VALFAROMEO_CONNECT(IF_ET_CHAN(fpc,pic,port,subport)),
+        # one VALFAROMEO_FPC block per FPC used.
+        'valfaromeo': re.compile(r'^et-[01]/0/[0-3]:[0-3]$'),
     }
     vm_interfaces = defaultdict(list)
 

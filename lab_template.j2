@@ -190,24 +190,33 @@ VPTX_CHASSIS_START()
         install "/vmm/data/user_disks/dhahm/valfaromeo/pxe_slot_attrib.conf" "/usr/share/pfe/pxe_slot_attrib.conf";
     VPTX_RE_END
 
-    VALFAROMEO_FPC_START_ (VPTX_CHASSIS_NAME, VALFAROMEO_FPC0)
+    #undef  FPC_BOOT_ARGS
+    #define FPC_BOOT_ARGS   " " /* Unused; for future expansions. */
+    // These come from i2cid_def_shared.h. Both AlfaRomeo linecards are the
+    // same hardware type, so they share the I2C id; the slot is distinguished
+    // by the VALFAROMEO_FPC<n> macro passed to the instance below.
+    #undef  FPC_I2CID
+    #define FPC_I2CID  0x0D7A /* I2C_ID_ALFAROMEO_LC */
+    #undef  VPTX_FPC_CHASSIS_MODEL
+    #define VPTX_FPC_CHASSIS_MODEL 263 /* JNX_PRODUCT_MODEL_MX10008 */
 
-        #undef FPC_BOOT_ARGS
-        #define FPC_BOOT_ARGS   " " /* Unused; for future expansions. */
-
-        // These I2CIDs come from i2cid_def_shared.h
-        #define FPC_I2CID  0x0D7A /* I2C_ID_ALFAROMEO_LC */
-        #define VPTX_FPC_CHASSIS_MODEL 263 /* JNX_PRODUCT_MODEL_MX10008 */
+    {# One FPC block per FPC actually used in 'links'. Interfaces are grouped
+       by their FPC number (et-<fpc>/0/<port>:<sub>), so a lab that only uses
+       FPC0 renders exactly as before, and FPC1 gets its own block only when
+       et-1/0/... interfaces are present. #}
+    {% for fpc_num, fpc_ifaces in vm.interfaces | groupby('fpc') %}
+    VALFAROMEO_FPC_START_ (VPTX_CHASSIS_NAME, VALFAROMEO_FPC{{ fpc_num }})
 
         setvar "qemu_args" "-drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_VARS.fd,if=pflash,format=raw,unit=1,readonly=on";
 
-        VALFAROMEO_FPC_INSTANCE_DISKLESS (VPTX_CHASSIS_NAME, VPTX_FPC_CHASSIS_MODEL, VALFAROMEO_RE0, VALFAROMEO_FPC0, FPC_I2CID, FPC_BOOT_ARGS)
+        VALFAROMEO_FPC_INSTANCE_DISKLESS (VPTX_CHASSIS_NAME, VPTX_FPC_CHASSIS_MODEL, VALFAROMEO_RE0, VALFAROMEO_FPC{{ fpc_num }}, FPC_I2CID, FPC_BOOT_ARGS)
 
-        {% for iface in vm.interfaces %}
+        {% for iface in fpc_ifaces %}
         VALFAROMEO_CONNECT (IF_ET_CHAN ({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}, {{ iface.subport }}),  {{ iface.bridge }})   // {{ iface.name }}
         {% endfor %}
 
     VALFAROMEO_FPC_END_
+    {% endfor %}
 VPTX_CHASSIS_END
 
 
