@@ -54,11 +54,12 @@
 #      and silently passes no traffic. The generator rejects them for you.
 #    - Disk alias MUST start with the type name (VROUTER_DISK and VSWITCH_DISK
 #      are the two literal exceptions).
-#    - vbugatti and vmx do NOT clash: vmx is chassis I2C id 21, vbugatti is
-#      based at 22. The id is a chassis MODEL identifier, not a per-lab unique
-#      key, so same-family devices share one (vhamilton and vmaserati are both
-#      273) and that is fine. The only case needing distinct ids is several
-#      vbugatti chassis in one lab, which are auto-numbered 22, 23, 24, ...
+#    - Chassis I2C ids are NOT a per-lab unique key, they identify a chassis
+#      MODEL, so different types sharing one is harmless. vmx and valfaromeo
+#      are both 21 and boot together fine (verified: MX960 and JNP10008 each
+#      come up with the right model and FPC, and traffic passes between them).
+#      vhamilton and vmaserati are both 273. The only case needing distinct ids
+#      is several vbugatti chassis in one lab, auto-numbered 22, 23, 24, ...
 #      You never set this yourself.
 #    - There is no 'sniffer' type: it is a 'server' on sniffer_disk, spliced
 #      into any link marked 'sniffer: true'.
