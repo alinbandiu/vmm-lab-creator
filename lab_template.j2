@@ -2,10 +2,6 @@
 {# Defining vmm needs #}
 
 #include "/vmm/bin/common.defs"
-{# vAlfaRomeo runs on the MX10008 chassis macros plus its own FPC macros.
-   These are included ahead of the VMX_PHASE block to match the ordering of
-   the known-good hand-written config, and only when the topology actually
-   uses the type, so the headers can't collide with the other profiles. #}
 #define VMX_PHASE 3
 #if VMX_PHASE == 3
 #include "/vmm/data/vmm-configs/common/vmxc/common.vmx.p3.defs"
@@ -14,56 +10,116 @@
 #else
 #include "/vmm/data/vmm-configs/common/vmxc/common.vmx.p1.defs"
 #endif
-{# These are gated on the types that actually need them. common.vptx.defs in
-   particular defines the channelized-et helpers (IF_ET_CHAN etc.); when it is
-   included AFTER common.valfaromeo.defs it overrides vAlfaRomeo's versions,
-   which makes VALFAROMEO_CONNECT emit an invalid interface name
-   ('VALFAROMEO_eth4') and 'vmm config' fail. The known-good hand-written
-   vAlfaRomeo config includes neither of these headers. #}
 {% if 'vrouter' in types or 'vswitch' in types %}
 #include "/homes/abstine/vmx-nested-macros/common.vjunos.defs"
-{% endif %}
-{% if 'vptx' in types or 'vscapa' in types or 'vbrackla' in types %}
-#include "/vmm/data/vmm-configs/common/vmxc/common.vptx.defs"
-{% endif %}
-{# vAlfaRomeo ships its OWN common.vptx.defs. It defines the VPTX_* chassis
-   macros and IF_ET_CHAN differently from the standard one, so the two can
-   never appear in the same file - hence valfaromeo is rejected alongside
-   vptx/vscapa/vbrackla in validate_topology(). Including the standard one
-   instead is what produced the invalid 'VALFAROMEO_eth4' interface. #}
-{% if 'valfaromeo' in types %}
-#include "/vmm/data/user_disks/dhahm/valfaromeo/common.vptx.defs"
-#include "/vmm/data/user_disks/dhahm/valfaromeo/common.valfaromeo.defs"
 {% endif %}
 {# vFerrari reuses the standard VMX chassis/MPC macros; it only needs its own
    MPC I2C id. #}
 {% if 'vferrari' in types %}
 #define VMX_ZT_MPC_I2CID   0xCD8
 {% endif %}
-{# NOTE: common.evovscapa.defs and common.evovptx.defs (which common.brackla.defs
-   depends on) both #define the same macro names with different values for
-   their respective hardware profiles (EVOVPTX_MPC_MEMORY, EVOVPTX_RE_NCPU,
-   EVOVPTX_FPC_CSPP_INSTANCE, BASECONFIG, etc.). Including both in one file
-   makes 'vmm config' fail its preprocessing step. 'vscapa' and 'vbrackla'
-   can therefore not currently be used together in the same topology/lab -
-   only include whichever one this topology actually uses. #}
-{% if 'vscapa' in types %}
-#include "/vmm/data/user_disks/vptxc/common.evovscapa.defs"
+{# vHamilton and vMaserati are vMX10004 linecards sharing the pre-vmm3 chassis
+   header. Both use PREFIXED connectors (VHAMILTON_/VMASERATI_CONNECT), so they
+   are rank 2 in VMM3_EMIT_RANK and each #undef-s the IF_ET_X aliases it uses -
+   that is what lets them share a file with the vmm3 EVO types.
+   NOTE: common.vmaserati.defs line 1 unconditionally pulls in
+   common.evovptx.utils.defs, whose EVOVPTX_CHASSIS_START_ differs from the one
+   in common.evovptx.defs below. cpp warns on that redefinition and VMM treats
+   any cpp warning as fatal, so the shared macro is #undef-ed before the EVO
+   include further down. Everything else the two headers share (IF_ET,
+   EVOVPTX_CONNECT, the MAC_LSB_* table) is byte-identical and warns silently. #}
+{% if 'vhamilton' in types or 'vmaserati' in types %}
+#include "/vmm/data/user_disks/mx-10k-m/mx10004/common.vmx10004.defs"
+{% endif %}
+{% if 'vhamilton' in types %}
+#include "/vmm/data/user_disks/vhamilton/common.vhamilton.defs"
+{% endif %}
+{% if 'vmaserati' in types %}
+#include "/vmm/data/user_disks/vmaserati/common.vmaserati.defs"
+{% endif %}
+
+{# =====================================================================
+   vmm3 EVO / cosim family - LOAD-BEARING include order.
+   common.evovptx.iface.et.defs (pulled in by common.evovptx.defs) installs ~250
+   UNPREFIXED IF_ET_X_* aliases. RAW connectors (EVOVPTX_CONNECT, LC304_CONNECT)
+   need them ALIVE; PREFIXED connectors (VBALERION_/VALFAROMEO_/
+   VBOWMORE_CONNECT) token-paste and need them DEAD. The single base
+   common.evovptx.defs is included first (NOT common.evovptx.utils.defs, which
+   redefines EVOVPTX_CHASSIS_START_ and would abort with a fatal warning). ardbeg
+   replaces the shared chassis macro, so it is #undef-ed before that include.
+   ===================================================================== #}
+{% if 'vscapa' in types or 'vardbeg' in types or 'vbrackla' in types or 'vbalerion' in types or 'vbowmore' in types or 'valfaromeo' in types or 'vbugatti' in types %}
+{# Dropped so common.evovptx.defs can install its own without a fatal cpp
+   warning when common.vmaserati.defs has already pulled in the utils variant.
+   '#undef' of an undefined macro is legal and silent, so this is unconditional. #}
+#undef EVOVPTX_CHASSIS_START_
+#include "/vmm/data/vmm-configs/common/vptxc/common.evovptx.defs"
 {% endif %}
 {% if 'vbrackla' in types %}
-#include "/vmm/data/user_disks/vptxc/common.brackla.defs"
-#include "/vmm/data/user_disks/vptxc/common.evovptx.defs"
+#include "/vmm/data/vmm-configs/common/vptxc/common.brackla.defs"
 {% endif %}
-{# vscapa and vbrackla are mutually exclusive (enforced in validate_topology()),
-   so VMM_ENV_CSPP_CFG_DIR only ever needs one value per generated file - no
-   need to redefine it per-VM. Redefining it repeatedly via #undef/#define
-   was found to break 'vmm config''s preprocessing, so this is set once. #}
+{% if 'vbalerion' in types %}
+#include "/vmm/data/vmm-configs/common/vptxc/common.balerion.defs"
+{% endif %}
 {% if 'vscapa' in types %}
-#define VMM_ENV_CSPP_CFG_DIR /vmm/data/user_disks/evo_test/EVOvSCAPA/
-{% elif 'vbrackla' in types %}
-#define VMM_ENV_CSPP_CFG_DIR /vmm/data/user_disks/evo_test/EVOvBRACKLA/COSIMPP/
+#include "/vmm/data/vmm-configs/common/vptxc/common.evovscapa.compat.defs"
 {% endif %}
-#define EVOVPTX_FPC_CSPP_IMG "/vmm/data/base_disks/junos/vevo/ubuntu_vm_evo.qcow2"
+{% if 'vardbeg' in types %}
+#undef EVOVPTX_CHASSIS_START_
+#include "/vmm/data/vmm-configs/common/vptxc/common.evovptx.ardbeg.defs"
+#include "/vmm/data/vmm-configs/common/vptxc/common.ardbeg.defs"
+{% endif %}
+{% if 'vbugatti' in types %}
+#include "/vmm/data/vmm-configs/common/vbugatti/headers/common.vmx304.defs"
+#include "/vmm/data/vmm-configs/common/vbugatti/headers/common.lc304.defs"
+{% endif %}
+{% if 'valfaromeo' in types %}
+#include "/vmm/data/vmm-configs/common/vmxc/vmx10008/common.vmx10008.defs"
+#include "/vmm/data/vmm-configs/common/valfaromeo/common.valfaromeo.defs"
+{% endif %}
+
+{% if 'vscapa' in types or 'vardbeg' in types or 'vbrackla' in types or 'vbalerion' in types or 'vbowmore' in types or 'valfaromeo' in types or 'vbugatti' in types %}
+#undef EVO_DEVELOPER_FILES
+#define EVO_DEVELOPER_FILES \
+    install "ENV(CONFIG_BASE)/evo-mount/yp.conf" "/etc/yp.conf"; \
+    install "ENV(CONFIG_BASE)/evo-mount/auto.evo" "/etc/auto.evo"; \
+    install "ENV(CONFIG_BASE)/evo-mount/auto.evofiler" "/etc/auto.evofiler"; \
+    install "ENV(CONFIG_BASE)/evo-mount/auto.master" "/etc/auto.master"; \
+    install "ENV(CONFIG_BASE)/evo-mount/nisdomainname" "/etc/nisdomainname"; \
+    install "ENV(CONFIG_BASE)/evo-mount/nsswitch.conf" "/etc/nsswitch.conf"; \
+    install "/vmm/data/vmm-configs/common/vptxc/rc.vmm" "/var/vmguest/rc.vmm"; \
+    install "ENV(CONFIG_BASE)/evo-mount/ssh_host_rsa_key" "/home/root/.ssh/ssh_host_rsa_key"; \
+    install "ENV(CONFIG_BASE)/evo-mount/ssh_host_rsa_key.pub" "/home/root/.ssh/ssh_host_rsa_key.pub";
+#define QS_CSPP_IMG            "/vmm/data/base_disks/junos/vevo/ubuntu_vm_evo.qcow2"
+#define PATH_CATENATE(DIR, FN) DIR/FN
+#define PATH_STRINGIZE(DIR, FN) STRINGIZE (PATH_CATENATE (DIR, FN))
+{% endif %}
+{% if 'vscapa' in types %}
+#undef EVOvScapa_BASECONFIG
+#define EVOvScapa_BASECONFIG "ENV(CONFIG_BASE)/junos/evovscapa.junos.base.conf"
+#define QS_CSPP_DIR_VSCAPA     /vmm/data/vmm-configs/common/vptxc/cspp_cfg/EVOvSCAPA
+{% endif %}
+{% if 'vbalerion' in types %}
+#define QS_CSPP_DIR_VBALERION  /vmm/data/vmm-configs/common/vptxc/cspp_cfg/EVOvBALERION
+#define VBALERION_CSPP_CFG_DIR /vmm/data/user_disks/evo_test/EVOvBALERION/
+{% endif %}
+{% if 'vardbeg' in types %}
+#define QS_CSPP_DIR_VARDBEG    /vmm/data/vmm-configs/common/vptxc/cspp_cfg/EVOvArdbeg
+#define VARDBEG_CSPP_CFG_DIR   /vmm/data/vmm-configs/common/vptxc/cspp_cfg/EVOvArdbeg
+{% endif %}
+{% if 'vbowmore' in types %}
+#define QS_CSPP_DIR_VBOWMORE   /vmm/data/user_disks/evo_test/EVOvBOWMORE
+{% endif %}
+{% if 'vbrackla' in types %}
+#define QS_CSPP_DIR_VBRACKLA   /vmm/data/vmm-configs/common/vptxc/cspp_cfg/EVOvBRACKLA
+#define VBRACKLA_CSPP_CFG_DIR  /vmm/data/vmm-configs/common/vptxc/cspp_cfg/EVOvBRACKLA/COSIMPP
+{# Emitted here, ONCE per lab, and deliberately NOT inside the per-vm loop.
+   vmm folds every '#define VMM_ENV_*' line in the file into a single process
+   environment variable that ENV() reads at bind time, so a second #define
+   appends rather than overwrites - even when both copies carry the same path.
+   See the CASE 3b comment on the vbrackla block for the full failure mode. #}
+#define VMM_ENV_CSPP_CFG_DIR   /vmm/data/vmm-configs/common/vptxc/cspp_cfg/EVOvBRACKLA/COSIMPP
+{% endif %}
 #undef vjunos_switch_disk
 #undef vjunos_router_disk
 
@@ -71,9 +127,9 @@
 {% if disk_name.startswith('vqfx') %}
 #define COSIM_DISK basedisk "/vmm/data/base_disks/default_images/default_image_vqfx10_mpc.img";
 #define {{ disk_name }} basedisk "{{ disk_path }}";
-{% elif disk_name.startswith('vmx') or disk_name.startswith('VROUTER') or disk_name.startswith ('VSWITCH') or disk_name.startswith ('vptx') or disk_name.startswith('vferrari') or disk_name.startswith('valfaromeo') %}
+{% elif disk_name.startswith('vmx') or disk_name.startswith('VROUTER') or disk_name.startswith ('VSWITCH') or disk_name.startswith('vferrari') or disk_name.startswith('valfaromeo') or disk_name.startswith('vbugatti') or disk_name.startswith('vhamilton') or disk_name.startswith('vmaserati') %}
 #define {{ disk_name }} basedisk "{{ disk_path }}";
-{% elif disk_name.startswith('vscapa') or disk_name.startswith('vbrackla') %}
+{% elif disk_name.startswith('vscapa') or disk_name.startswith('vbrackla') or disk_name.startswith('vbalerion') or disk_name.startswith('vardbeg') or disk_name.startswith('vbowmore') %}
 #define {{ disk_name }} "{{ disk_path }}"
 {% else %}
 #define {{ disk_name }} basedisk "{{ disk_path }}"
@@ -82,18 +138,20 @@
 
 ##################################################################################
 
-TOPOLOGY_START({{ lab_name }}) 
+TOPOLOGY_START({{ lab_name }})
 
-{# This loop dynamically creates one bridge for each link in the YAML file #}
+{# One bridge per link in the YAML file. #}
 {% for link in links %}
 bridge "111__{{ loop.index }}aaeppss"{};
 {% endfor %}
 
 
-{# This loop iterates over each VM defined in the YAML file #}
+{# VMs are emitted in vmm3 family order (RAW -> PREFIXED -> vbowmore last),
+   pre-sorted in generate_config (VMM3_EMIT_RANK). Ports connect to the normal
+   per-link bridge, not the literal 'privateN' bridges from the reference. #}
 {% for vm in vms %}
 
-{# --- CASE 1: Handle 'vmx' type (multi-FPC) --- #}
+{# --- CASE 1: 'vmx' (multi-FPC) --- #}
 {% if vm.type == 'vmx' %}
 #undef  VMX_CHASSIS_I2CID
 #undef  VMX_CHASSIS_NAME
@@ -102,16 +160,8 @@ bridge "111__{{ loop.index }}aaeppss"{};
 VMX_CHASSIS_START()
     VMX_RE_START({{ vm.hostname }}_RE, 0)
         VMX_RE_INSTANCE({{ vm.hostname }}_RE, {{ vm.disk }}, VMX_RE_I2CID, 0)
-        {# No baseline config is installed here any more. The vmx boots with
-           only the lab's inherited groups (which provide netconf/ssh access),
-           and vmm.py pushes the full baseline over SSH post-boot - see
-           VMX_BASELINE_LINES / configure_vmx_ssh() in vmm.py. #}
         VMX_SYSTEST_CONFIG_ENHIP
     VMX_RE_END
-    {# Only FPCs that have at least one interface used in 'links' get a block.
-       Naming matches the existing "_RE"/"_FPC<n>" convention (same as
-       vptx/vscapa) so get_vmx_nodes()'s "_RE" split and the "_FPC" serial
-       filter in vmm.py work unmodified for multi-FPC vmx too. #}
     {% for group in vm.fpc_groups %}
     VMX_MPC_START({{ vm.hostname }}_FPC{{ group.fpc }}, {{ group.fpc }})
         #undef VMX_MPC_DISK
@@ -132,11 +182,7 @@ VMX_CHASSIS_END
 
 
 
-{# --- CASE 1b: Handle 'vferrari' type ---
-   Reuses the standard VMX chassis/MPC macros, with a single FPC0 carrying
-   5 fixed (non-channelized) 100G ports, et-0/0/0 .. et-0/0/4. Junos sees
-   them as et-, but the VMM macro is ET(fpc,pic,port,subport) with the
-   subport pinned to 0. #}
+{# --- CASE 1b: 'vferrari' (single FPC0, 5 x 100G ports) --- #}
 {% elif vm.type == 'vferrari' %}
 #undef  VMX_CHASSIS_I2CID
 #define VMX_CHASSIS_I2CID   33
@@ -149,6 +195,16 @@ VMX_CHASSIS_END
 VMX_CHASSIS_START()
     VMX_RE_START({{ vm.hostname }}_RE, 0)
         VMX_RE_INSTANCE({{ vm.hostname }}_RE, {{ vm.disk }}, VMX_RE_I2CID, 0)
+        {# The ZT MPC (VMX_ZT_MPC_I2CID 0xCD8) is only supported in
+           'network-services enhanced-ip'. Without this the RE boots in the
+           default 'ip' mode and chassisd marks FPC0
+           'Offline ---FPC misconfiguration---'.
+           The Phase 4 baseline also sets enhanced-ip, but a network-services
+           change does not take effect until the chassis resets, so applying it
+           post-boot leaves FPC0 down until the device is rebooted by hand.
+           This installs the enhanced-ip base config so the RE comes up in the
+           right mode to begin with - same hook the 'vmx' case above uses. #}
+        VMX_SYSTEST_CONFIG_ENHIP
     VMX_RE_END
 
     VMX_MPC_START({{ vm.hostname }}_FPC0, 0)
@@ -163,159 +219,334 @@ VMX_CHASSIS_END
 
 
 
-{# --- CASE 1c: Handle 'valfaromeo' type ---
-   MX10008 chassis + VALFAROMEO FPC macros. FPC0 carries 4 ports x 4
-   channelized subports, et-0/0/0:0 .. et-0/0/3:3, connected with
-   IF_ET_CHAN(fpc,pic,port,subport). Management is on em0, not fxp0. #}
-{% elif vm.type == 'valfaromeo' %}
-#undef VPTX_CHASSIS_NAME
-#define VPTX_CHASSIS_NAME {{ vm.hostname }}
-VPTX_CHASSIS_START()
-    VPTX_RE_START({{ vm.hostname }}_RE, 0)
-        setvar "qemu_args" "-smbios type=1,product=PviModel,manufacturer=JUNIPER";
-        VPTX_RE_INSTANCE({{ vm.hostname }}_RE, {{ vm.disk }}, VPTX_RE_I2CID, 0)
+{# --- CASE 1d: 'vbugatti' (vMX304 + LC304 linecard) [vmm3] ---
+   RE console '{hostname}-re0'. Chassis I2C id from vm.chassis_i2cid (base 22,
+   so it coexists with valfaromeo=21). #}
+{% elif vm.type == 'vbugatti' %}
+#undef  VMX304_CHASSIS_I2CID
+#undef  VMX304_CHASSIS_NAME
+#define VMX304_CHASSIS_I2CID {{ vm.chassis_i2cid }}
+#define VMX304_CHASSIS_NAME  {{ vm.hostname }}
+#undef  FPC_BOOT_ARGS
+#define FPC_BOOT_ARGS " "
+VMX304_CHASSIS_START()
+VMX304_RE_START({{ vm.hostname }}-re0, 0)
+    setvar "qemu_args" "-smbios type=1,product=PviModel,manufacturer=JUNIPER";
+    VMX304_RE_INSTANCE({{ vm.hostname }}-re0, {{ vm.disk }}, VMX_RE_I2CID, 0)
+    setvar "metadata_disk_size" "4096M";
+    setvar "vm_retype" "RE-TVP";
+    setvar "hgcomm_vector_idx" "6";
+    install "/vmm/data/user_disks/vbugatti/config_files/mx304-meta-data-disk.img" "/tvp_platform_config.tgz";
+    install "/vmm/data/user_disks/vbugatti/config_files/system.config" "/root/olive.conf";
+    install "/vmm/data/user_disks/vbugatti/config_files/inetd.conf" "/etc/inetd.conf";
+    install "/vmm/data/user_disks/vbugatti/config_files/jlaunchd.conf" "/etc/jlaunchd.conf";
+    install "/vmm/data/user_disks/vbugatti/config_files/pxe_slot_attrib.conf" "/usr/share/pfe/pxe_slot_attrib.conf";
+VMX304_RE_END
+LC304_FPC_START_(VMX304_CHASSIS_NAME, LC304_FPC0)
+    setvar "qemu_args" "-drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_VARS.fd,if=pflash,format=raw,unit=1,readonly=on";
+    LC304_FPC_INSTANCE_DISKLESS(VMX304_CHASSIS_NAME, VMX304_CHASSIS_I2CID, LC304_RE0, LC304_FPC0, VMX304_MPC_I2CID, FPC_BOOT_ARGS)
+    {% for iface in vm.interfaces %}
+    LC304_CONNECT(LC304_IF_ET_100G({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
+    {% endfor %}
+LC304_FPC_END_
+VMX304_CHASSIS_END
+
+
+
+{# --- CASE 1e: 'vhamilton' (vMX10004, up to 3 linecards) [old-pod, kept] --- #}
+{% elif vm.type == 'vhamilton' %}
+{% for iface in vm.interfaces %}
+#undef IF_ET_X_{{ iface.pic }}_{{ iface.port }}
+{% endfor %}
+#undef  VMX10004_CHASSIS_NAME
+#define VMX10004_CHASSIS_NAME {{ vm.hostname }}
+VMX10004_CHASSIS_START()
+    VMX10004_RE_START({{ vm.hostname }}_RE, 0)
+        VMX10004_RE_INSTANCE({{ vm.hostname }}, {{ vm.disk }}, VMX10004_RE_I2CID, 0)
         setvar "smbios.system.maker" "JUNIPER";
         setvar "smbios.system.product" "RE-PTX-2X00x8";
         setvar "vm_retype" "RE-TVP";
-        setvar "hgcomm_vector_idx" "5";
-        install "/vmm/data/user_disks/dhahm/valfaromeo/default_tvp_platform_config_mx_tgz.img" "/tvp_platform_config.tgz";
-        {# This system.config is the 12 x 100G_CHAN profile, which is what
-           gives the channelized et-0/0/<port>:<subport> interfaces this type
-           is validated against. dhahm's copy is the 4 x 100G (unchannelized)
-           variant - swap it here if you want plain et-0/0/0..3 instead. #}
-        install "/vmm/data/user_disks/valfaromeo/system.config" "/root/olive.conf";
-        install "/vmm/data/user_disks/vredbull/conf/services" "/etc/services";
-        install "/vmm/data/user_disks/vredbull/conf/inetd.conf" "/etc/inetd.conf";
-        install "/vmm/data/user_disks/dhahm/valfaromeo/jlaunchd.conf" "/etc/jlaunchd.conf";
-        install "/vmm/data/user_disks/dhahm/valfaromeo/pxe_slot_attrib.conf" "/usr/share/pfe/pxe_slot_attrib.conf";
-    VPTX_RE_END
-
-    #undef  FPC_BOOT_ARGS
-    #define FPC_BOOT_ARGS   " " /* Unused; for future expansions. */
-    // These come from i2cid_def_shared.h. Both AlfaRomeo linecards are the
-    // same hardware type, so they share the I2C id; the slot is distinguished
-    // by the VALFAROMEO_FPC<n> macro passed to the instance below.
-    #undef  FPC_I2CID
-    #define FPC_I2CID  0x0D7A /* I2C_ID_ALFAROMEO_LC */
-    #undef  VPTX_FPC_CHASSIS_MODEL
-    #define VPTX_FPC_CHASSIS_MODEL 263 /* JNX_PRODUCT_MODEL_MX10008 */
-
-    {# One FPC block per FPC actually used in 'links'. Interfaces are grouped
-       by their FPC number (et-<fpc>/0/<port>:<sub>), so a lab that only uses
-       FPC0 renders exactly as before, and FPC1 gets its own block only when
-       et-1/0/... interfaces are present. #}
+        setvar "hgcomm_vector_idx" "7";
+        install "/vmm/data/user_disks/mx-10k-m/mx10004/default_tvp_platform_config_mx_tgz.img" "/tvp_platform_config.tgz";
+        install "/vmm/data/user_disks/mx-10k-m/mx10004/system.config" "/root/olive.conf";
+        install "/vmm/data/user_disks/mx-10k-m/common/services" "/etc/services";
+        install "/vmm/data/user_disks/mx-10k-m/common/inetd.conf" "/etc/inetd.conf";
+        install "/vmm/data/user_disks/mx-10k-m/common/jlaunchd.conf" "/etc/jlaunchd.conf";
+        install "/vmm/data/user_disks/mx-10k-m/mx10004/pxe_slot_attrib.conf" "/usr/share/pfe/pxe_slot_attrib.conf";
+    VMX10004_RE_END
+#undef  FPC_BOOT_ARGS
+#define FPC_BOOT_ARGS " "
+#undef  VHAMILTON_I2CID
+#define VHAMILTON_I2CID 0x0DD5
+#undef  VMX10004_FPC_CHASSIS_MODEL
+#define VMX10004_FPC_CHASSIS_MODEL 273
     {% for fpc_num, fpc_ifaces in vm.interfaces | groupby('fpc') %}
-    VALFAROMEO_FPC_START_ (VPTX_CHASSIS_NAME, VALFAROMEO_FPC{{ fpc_num }})
-
-        setvar "qemu_args" "-drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_VARS.fd,if=pflash,format=raw,unit=1,readonly=on";
-
-        VALFAROMEO_FPC_INSTANCE_DISKLESS (VPTX_CHASSIS_NAME, VPTX_FPC_CHASSIS_MODEL, VALFAROMEO_RE0, VALFAROMEO_FPC{{ fpc_num }}, FPC_I2CID, FPC_BOOT_ARGS)
-
+    VHAMILTON_FPC_START_(VMX10004_CHASSIS_NAME, VHAMILTON_FPC{{ fpc_num }})
+        setvar "qemu_args" "-drive file=/vmm/data/user_disks/mx-10k-m/vulc/vULC_OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=/vmm/data/user_disks/mx-10k-m/vulc/vULC_OVMF_VARS.fd,if=pflash,format=raw,unit=1,readonly=on";
+        VHAMILTON_FPC_INSTANCE_DISKLESS(VMX10004_CHASSIS_NAME, VMX10004_FPC_CHASSIS_MODEL, VHAMILTON_RE0, VHAMILTON_FPC{{ fpc_num }}, VHAMILTON_I2CID, FPC_BOOT_ARGS)
         {% for iface in fpc_ifaces %}
-        VALFAROMEO_CONNECT (IF_ET_CHAN ({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}, {{ iface.subport }}),  {{ iface.bridge }})   // {{ iface.name }}
+        VHAMILTON_CONNECT(IF_ET({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
         {% endfor %}
-
-    VALFAROMEO_FPC_END_
+    VHAMILTON_FPC_END_
     {% endfor %}
-VPTX_CHASSIS_END
+VMX10004_CHASSIS_END
 
 
 
-{# --- CASE 2: Handle 'vptx' type --- #}
-{% elif vm.type == 'vptx' %}
-#undef VPTX_CHASSIS_I2CID
-#define VPTX_CHASSIS_I2CID 85
-#undef VPTX_CHASSIS_NAME
-#define VPTX_CHASSIS_NAME {{ vm.hostname }}
-#undef {{ vm.disk }}
-{% for disk_name, disk_path in disks.items() %}
-{% if disk_name.startswith('vptx') %}
-#define {{ vm.disk }} basedisk "{{ disk_path }}";
-{% endif %}
+{# --- CASE 10: 'vmaserati' [vMX10004 + VMASERATI_CONNECT, PREFIXED] ---
+   RE console '{hostname}_RE'. Two pics on one linecard: pic0 = 20 ports,
+   pic1 = 16. Modelled on the vendor reference topology
+   /vmm/data/user_disks/vmaserati/vmaserati-1router-mx10k4.config. #}
+{% elif vm.type == 'vmaserati' %}
+{% for iface in vm.interfaces %}
+#undef IF_ET_X_{{ iface.pic }}_{{ iface.port }}
 {% endfor %}
-   VPTX_CHASSIS_START()
-      VPTX_RE_START({{vm.hostname}}_RE, 0)
-         VPTX_RE_INSTANCE({{vm.hostname}}_RE, {{vm.disk}}, VPTX_RE_I2CID, 0)
-      VPTX_RE_END
-      VPTX_MPC_START({{vm.hostname}}_FPC, 0)
-          #undef VPTX_MPC_DISK
-          #define VPTX_MPC_DISK VIRTUAL_MPC_DISK
-         VPTX_MPC_INSTANCE({{vm.hostname}}_FPC, VPTX_MPC_DISK, VPTX_MPC_I2CID, 0)
-          {% for iface in vm.interfaces %}
-          VPTX_CONNECT(ET({{ iface.fpc }},{{ iface.pic }},{{ iface.port }},{{iface.subport}}),{{ iface.bridge }})
-          {% endfor %}
-      VPTX_MPC_END
-   VPTX_CHASSIS_END
+#undef  VMX10004_CHASSIS_NAME
+#define VMX10004_CHASSIS_NAME {{ vm.hostname }}
+VMX10004_CHASSIS_START()
+    VMX10004_RE_START({{ vm.hostname }}_RE, 0)
+        VMX10004_RE_INSTANCE({{ vm.hostname }}, {{ vm.disk }}, VMX10004_RE_I2CID, 0)
+        setvar "smbios.system.maker" "JUNIPER";
+        setvar "smbios.system.product" "RE-PTX-2X00x8";
+        setvar "vm_retype" "RE-TVP";
+        setvar "hgcomm_vector_idx" "7";
+        install "/vmm/data/user_disks/mx-10k-m/mx10004/default_tvp_platform_config_mx_tgz.img" "/tvp_platform_config.tgz";
+        install "/vmm/data/user_disks/mx-10k-m/mx10004/system.config" "/root/olive.conf";
+        install "/vmm/data/user_disks/mx-10k-m/common/services" "/etc/services";
+        install "/vmm/data/user_disks/mx-10k-m/common/inetd.conf" "/etc/inetd.conf";
+        install "/vmm/data/user_disks/mx-10k-m/common/jlaunchd.conf" "/etc/jlaunchd.conf";
+        install "/vmm/data/user_disks/vmaserati/pxe_slot_attrib.conf" "/usr/share/pfe/pxe_slot_attrib.conf";
+    VMX10004_RE_END
+#undef  FPC_BOOT_ARGS
+#define FPC_BOOT_ARGS " "
+#undef  VMASERATI_I2CID
+#define VMASERATI_I2CID 0x0F18
+#undef  VMX10004_FPC_CHASSIS_MODEL
+#define VMX10004_FPC_CHASSIS_MODEL 273
+    {% for fpc_num, fpc_ifaces in vm.interfaces | groupby('fpc') %}
+    VMASERATI_FPC_START_(VMX10004_CHASSIS_NAME, VMASERATI_FPC{{ fpc_num }})
+        setvar "qemu_args" "-drive file=/vmm/data/user_disks/mx-10k-m/vulc/vULC_OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=/vmm/data/user_disks/mx-10k-m/vulc/vULC_OVMF_VARS.fd,if=pflash,format=raw,unit=1,readonly=on";
+        VMASERATI_FPC_INSTANCE_DISKLESS(VMX10004_CHASSIS_NAME, VMX10004_FPC_CHASSIS_MODEL, VMASERATI_RE0, VMASERATI_FPC{{ fpc_num }}, VMASERATI_I2CID, FPC_BOOT_ARGS)
+        {% for iface in fpc_ifaces %}
+        VMASERATI_CONNECT(IF_ET({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
+        {% endfor %}
+    VMASERATI_FPC_END_
+    {% endfor %}
+VMX10004_CHASSIS_END
 
 
 
+{# ===================== vmm3 RAW consumers (rank 1) ===================== #}
 
-{# --- CASE 3: Handle 'vscapa' type --- #}
+{# --- CASE 3: 'vscapa' [vmm3, EVOvScapa_* + evovscapa.compat] --- #}
 {% elif vm.type == 'vscapa' %}
 #undef  PTX_CHAS_NAME
-#define PTX_CHAS_NAME      {{ vm.hostname }}
+#define PTX_CHAS_NAME {{ vm.hostname }}
 #undef  PTX_CHAS_I2CID
-#define PTX_CHAS_I2CID     240  /* JNX_PRODUCT_PTX10008 = 240 */
-#define EVO_DEVELOPER_FILES \
-        install "ENV(CONFIG_BASE)/evo-mount/yp.conf" "/etc/yp.conf";  \
-        install "ENV(CONFIG_BASE)/evo-mount/auto.evo" "/etc/auto.evo"; \
-        install "ENV(CONFIG_BASE)/evo-mount/auto.evofiler" "/etc/auto.evofiler"; \
-        install "ENV(CONFIG_BASE)/evo-mount/auto.master" "/etc/auto.master";  \
-        install "ENV(CONFIG_BASE)/evo-mount/nisdomainname" "/etc/nisdomainname";   \
-        install "ENV(CONFIG_BASE)/evo-mount/nsswitch.conf" "/etc/nsswitch.conf";   \
-        install "/vmm/data/vmm-configs/common/vptxc/rc.vmm" "/var/vmguest/rc.vmm";   \
-        install "ENV(CONFIG_BASE)/evo-mount/ssh_host_rsa_key" "/home/root/.ssh/ssh_host_rsa_key"; \
-        install "ENV(CONFIG_BASE)/evo-mount/ssh_host_rsa_key.pub" "/home/root/.ssh/ssh_host_rsa_key.pub";
-
-EVOVPTX_CHASSIS_START_ (PTX_CHAS_NAME)
-    EVOVPTX_RE_START_ (PTX_CHAS_NAME, EVOVPTX_RE0)
-        #undef RE_BOOT_ARGS
-        #define RE_BOOT_ARGS   " "
-        #undef RE_I2CID
-        #define RE_I2CID  0x0CA3
-        EVOVPTX_RE0_INSTANCE_ISO_AUTODISK (PTX_CHAS_NAME, PTX_CHAS_I2CID, {{ vm.disk }}, EVOVPTX_RE0, RE_I2CID, RE_BOOT_ARGS)
+#define PTX_CHAS_I2CID 240
+#undef  RE_BOOT_ARGS
+#define RE_BOOT_ARGS " "
+#undef  FPC_BOOT_ARGS
+#define FPC_BOOT_ARGS " "
+EVOvScapa_CHASSIS_START_(PTX_CHAS_NAME)
+    EVOvScapa_RE_START_(PTX_CHAS_NAME, EVOvScapa_RE0)
+        EVOvScapa_RE0_INSTANCE_ISO_AUTODISK(PTX_CHAS_NAME, PTX_CHAS_I2CID, {{ vm.disk }}, EVOvScapa_RE0, 0x0CA3, RE_BOOT_ARGS)
         EVO_DEVELOPER_FILES
-    EVOVPTX_RE_END_
-
-    EVOVPTX_FPC_START_ (PTX_CHAS_NAME, EVOVPTX_FPC0)
-        #undef FPC_BOOT_ARGS
-        #define FPC_BOOT_ARGS   " "
-        #undef FPC_I2CID
-        #define FPC_I2CID  0x0D07
-        EVOVPTX_FPC_INSTANCE_DISKLESS (PTX_CHAS_NAME, PTX_CHAS_I2CID, EVOVPTX_RE0, EVOVPTX_FPC0, FPC_I2CID, FPC_BOOT_ARGS)
-    EVOVPTX_FPC_END_
-
-    EVOVPTX_FPC_CSPP_START_ (PTX_CHAS_NAME, EVOVPTX_FPC0)
-        EVOVPTX_FPC_CSPP_INSTANCE (PTX_CHAS_NAME, EVOVPTX_FPC0, EVOVPTX_FPC_CSPP_IMG)
-        EVOVPTX_INSTALL_FPC_CSPP_BUNDLE_SCAPA (VMM_ENV_CSPP_CFG_DIR)
-        {# This loop connects all the interfaces defined in the YAML file #}
+    EVOvScapa_RE_END_
+    EVOvScapa_FPC_START_(PTX_CHAS_NAME, EVOvScapa_FPC0)
+        EVOvScapa_FPC_INSTANCE_DISKLESS(PTX_CHAS_NAME, PTX_CHAS_I2CID, EVOvScapa_RE0, EVOvScapa_FPC0, 0x0D07, FPC_BOOT_ARGS)
+    EVOvScapa_FPC_END_
+    EVOvScapa_FPC_CSPP_START_(PTX_CHAS_NAME, EVOvScapa_FPC0)
+        EVOvScapa_FPC_CSPP_INSTANCE(PTX_CHAS_NAME, EVOvScapa_FPC0, QS_CSPP_IMG)
+        EVOvScapa_INSTALL_FPC_CSPP_BUNDLE_SCAPA(QS_CSPP_DIR_VSCAPA)
         {% for iface in vm.interfaces %}
-        EVOVPTX_CONNECT (IF_ET({{ iface.fpc }},{{ iface.pic }},{{ iface.port }}), {{ iface.bridge }})
+        EVOVPTX_CONNECT(IF_ET({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
         {% endfor %}
-    EVOVPTX_FPC_CSPP_END_
+    EVOvScapa_FPC_CSPP_END_
+EVOvScapa_CHASSIS_END_
+
+
+
+{# --- CASE 3d: 'vardbeg' [vmm3, EVOvArdbegRE, RAW] --- #}
+{% elif vm.type == 'vardbeg' %}
+#undef  PTX_CHAS_NAME
+#define PTX_CHAS_NAME {{ vm.hostname }}
+EVOVPTX_CHASSIS_START_(PTX_CHAS_NAME)
+    EVOvArdbegRE(PTX_CHAS_NAME, {{ vm.disk }})
+    EVOvArdbeg_CSPP_INSTANCE_START(PTX_CHAS_NAME, QS_CSPP_IMG)
+        {% for iface in vm.interfaces %}
+        EVOVPTX_CONNECT(IF_ET({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
+        {% endfor %}
+    EVOvArdbeg_CSPP_END
 EVOVPTX_CHASSIS_END_
 
 
 
+{# --- CASE 3b: 'vbrackla' [vmm3, EVOvBracklaRE + EVOvBrackla_CSPP_START, RAW] ---
+   RE console '{hostname}_RE0'.
 
-{# --- CASE 3b: Handle 'vbrackla' type --- #}
+   VMM_ENV_CSPP_CFG_DIR must be defined EXACTLY ONCE per generated .conf.
+   It is not a plain cpp macro: vmm harvests every '#define VMM_ENV_*' line out
+   of the whole file into a single process environment variable that ENV() reads
+   at bind time. '#undef' does not remove a previous value - a second #define
+   makes the variable hold BOTH paths joined by a newline, so vendor's
+   CSPPinstall (common.brackla.defs:85, which hardcodes
+   ENV(VMM_ENV_CSPP_CFG_DIR)) resolves to
+   '<first-dir>\n<second-dir>/vbrackla_cspp.conf' - a file that does not exist.
+   vmm bind then fails with (-1), the CSPP vm stays Unbound, and the RE shows
+   FPC1 stuck in 'Onlining' forever because its PFE never boots.
+
+   Two ways this duplicated before the fix, and BOTH are now closed:
+     1. the define lived in the per-vm loop, so N vbrackla devices emitted N
+        copies - identical text still concatenates into '<dir>\n<dir>';
+     2. vbowmore redefined the same name for its own bundle dir.
+   The define is therefore emitted once in the header under
+   {% raw %}{% if 'vbrackla' in types %}{% endraw %}, and every other CSPP type takes its
+   bundle dir as a macro PARAMETER instead
+   (e.g. EVOVPTX_INSTALL_FPC_CSPP_BUNDLE_BOWMORE(QS_CSPP_DIR_VBOWMORE)), so
+   vbrackla stays the only consumer of this env var. #}
 {% elif vm.type == 'vbrackla' %}
 #undef  PTX_CHAS_NAME
-#define PTX_CHAS_NAME      {{ vm.hostname }}-vBrackla
-
-EVOVPTX_CHASSIS_START_ (PTX_CHAS_NAME)
+#define PTX_CHAS_NAME {{ vm.hostname }}
+EVOVPTX_CHASSIS_START_(PTX_CHAS_NAME)
     EVOvBracklaRE(PTX_CHAS_NAME, {{ vm.disk }})
-    EVOvBrackla_CSPP_START(PTX_CHAS_NAME, EVOVPTX_FPC_CSPP_IMG)
+    EVOvBrackla_CSPP_START(PTX_CHAS_NAME, QS_CSPP_IMG)
         {% for iface in vm.interfaces %}
-        EVOVPTX_CONNECT(IF_ET({{ iface.fpc }},{{ iface.pic }},{{ iface.port }}), {{ iface.bridge }})
+        EVOVPTX_CONNECT(IF_ET({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
         {% endfor %}
     EVOvBrackla_CSPP_END
 EVOVPTX_CHASSIS_END_
 
 
 
+{# ===================== vmm3 PREFIXED consumers (rank 2) =====================
+   Each PREFIXED block #undef-s only the IF_ET_X aliases it uses, so its
+   token-pasting *_CONNECT expands the raw form (not the alias -> not junk like
+   'VBALERION_eth13').
 
-{# --- CASE 4: Handle 'vrouter' type --- #}
+   The #undef MUST be keyed by PIC, not FPC. Verified on the pod:
+       #define IF_ET(FPC, PIC, PORT)       CATENATE(IF_ET_X_, CATENATE3(PIC, _, PORT))
+       #define IF_ET_CHAN(FPC,PIC,PORT,CH) CATENATE(IF_ET_X_, CATENATE5(PIC, _, PORT, _, CH))
+   FPC is discarded by both macros - IF_ET(1,0,0) and IF_ET(0,0,0) are both eth4,
+   while IF_ET(0,1,0) is eth16. Using iface.fpc here silently undef-s the wrong
+   symbol on any multi-linecard device (valfaromeo allows 3 FPCs), leaving the
+   real alias live so *_CONNECT emits 'VALFAROMEO_eth4'. VMM accepts that name
+   without complaint and the link is created but never bound -> silent dead link,
+   the same failure class as wiring a port outside the CSPP range. #}
+
+{# --- CASE 3c: 'vbalerion' [vmm3, VBALERION_CONNECT] --- #}
+{% elif vm.type == 'vbalerion' %}
+{% for iface in vm.interfaces %}
+#undef IF_ET_X_{{ iface.pic }}_{{ iface.port }}
+{% endfor %}
+#undef  PTX_CHAS_NAME
+#define PTX_CHAS_NAME {{ vm.hostname }}
+#undef  EVOvBalerion_RE_MEMORY
+#define EVOvBalerion_RE_MEMORY 16384
+    EVOvBalerionRE(PTX_CHAS_NAME, {{ vm.disk }})
+    EVOvBalerion_CSPP_INSTANCE_START(PTX_CHAS_NAME, QS_CSPP_IMG)
+        {% for iface in vm.interfaces %}
+        VBALERION_CONNECT(IF_ET({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
+        {% endfor %}
+    EVOvBalerion_CSPP_END
+
+
+
+{# --- CASE 1c: 'valfaromeo' [vmm3, VMX10008 + VALFAROMEO_CONNECT, PREFIXED] ---
+   RE console '{hostname}-re0'. Channelized (IF_ET_CHAN); up to 3 linecards. #}
+{% elif vm.type == 'valfaromeo' %}
+{% for iface in vm.interfaces %}
+#undef IF_ET_X_{{ iface.pic }}_{{ iface.port }}_{{ iface.subport }}
+{% endfor %}
+#undef  VMX10008_CHASSIS_I2CID
+#define VMX10008_CHASSIS_I2CID 21
+#undef  VMX10008_CHASSIS_NAME
+#define VMX10008_CHASSIS_NAME {{ vm.hostname }}
+#undef  FPC_BOOT_ARGS
+#define FPC_BOOT_ARGS " "
+#undef  VMX10008_FPC_CHASSIS_MODEL
+#define VMX10008_FPC_CHASSIS_MODEL 272
+#undef  VALFAROMEO_I2CID
+#define VALFAROMEO_I2CID 0x0D7A
+VMX10008_CHASSIS_START()
+VMX10008_RE_START({{ vm.hostname }}-re0, 0)
+    setvar "qemu_args" "-smbios type=1,product=PviModel,manufacturer=JUNIPER";
+    VMX10008_RE_INSTANCE({{ vm.hostname }}-re0, {{ vm.disk }}, VMX_RE_I2CID, 0)
+    setvar "metadata_disk_size" "4096M";
+    setvar "vm_retype" "RE-TVP";
+    setvar "hgcomm_vector_idx" "5";
+    setvar "smbios.system.maker" "JUNIPER";
+    setvar "smbios.system.product" "RE-PTX-2X00x8";
+    install "/vmm/data/user_disks/mx-10k-m/mx10008/default_tvp_platform_config_mx_tgz.img" "/tvp_platform_config.tgz";
+    install "/vmm/data/user_disks/valfaromeo/system.config" "/root/olive.conf";
+    install "/vmm/data/user_disks/vredbull/conf/services" "/etc/services";
+    install "/vmm/data/user_disks/vredbull/conf/inetd.conf" "/etc/inetd.conf";
+    install "/vmm/data/user_disks/valfaromeo/jlaunchd.conf" "/etc/jlaunchd.conf";
+    install "/vmm/data/user_disks/valfaromeo/pxe_slot_attrib.conf" "/usr/share/pfe/pxe_slot_attrib.conf";
+VMX10008_RE_END
+    {% for fpc_num, fpc_ifaces in vm.interfaces | groupby('fpc') %}
+    VALFAROMEO_FPC_START_(VMX10008_CHASSIS_NAME, VALFAROMEO_FPC{{ fpc_num }})
+        setvar "qemu_args" "-drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_CODE.fd,if=pflash,format=raw,unit=0,readonly=on -drive file=/vmm/data/user_disks/vredbull/boot/vREDBULL_OVMF_VARS.fd,if=pflash,format=raw,unit=1,readonly=on";
+        VALFAROMEO_FPC_INSTANCE_DISKLESS(VMX10008_CHASSIS_NAME, VMX10008_FPC_CHASSIS_MODEL, VALFAROMEO_RE0, VALFAROMEO_FPC{{ fpc_num }}, VALFAROMEO_I2CID, FPC_BOOT_ARGS)
+        {% for iface in fpc_ifaces %}
+        VALFAROMEO_CONNECT(IF_ET_CHAN({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}, {{ iface.subport }}), {{ iface.bridge }})   // {{ iface.name }}
+        {% endfor %}
+    VALFAROMEO_FPC_END_
+    {% endfor %}
+VMX10008_CHASSIS_END
+
+
+
+{# --- CASE 9: 'vbowmore' [vmm3, EMITTED LAST] ---
+   vbowmore has no EVOvBowmore_* macros; it overrides the shared EVOVPTX_* ones.
+   The VMM3_EMIT_RANK sort places it last, so scapa/ardbeg/brackla already
+   expanded with the stock macros. Clear what bowmore replaces, then late-include
+   common.evovbowmore.defs so only this chassis picks up bowmore's versions. #}
+{% elif vm.type == 'vbowmore' %}
+#undef EVOVPTX_MPC_MEMORY
+#undef EVOVPTX_RE_NCPU
+#undef EVOVPTX_MPC_NCPU
+#undef EVOVPTX_CHAS_SINET_BRIDGES
+#undef EVOVPTX_RE0_SINET_IFS
+#undef EVOVPTX_RE1_SINET_IFS
+#undef EVOVPTX_RE0_INSTANCE_ISO
+#undef EVOVPTX_RE1_INSTANCE_ISO
+#undef EVOVPTX_RE0_INSTANCE_ISO_AUTODISK
+#undef EVOVPTX_RE1_INSTANCE_ISO_AUTODISK
+#undef EVOVPTX_XRE_INSTANCE_ISO_AUTODISK
+#undef EVOVPTX_FPC_CSPP_INSTANCE
+#undef BASECONFIG
+#include "/vmm/data/vmm-configs/common/vptxc/common.evovbowmore.defs"
+{% for iface in vm.interfaces %}
+#undef IF_ET_X_{{ iface.pic }}_{{ iface.port }}
+{% endfor %}
+#undef  PTX_CHAS_NAME
+#define PTX_CHAS_NAME {{ vm.hostname }}
+#undef  PTX_CHAS_I2CID
+#define PTX_CHAS_I2CID 254
+#undef  RE_BOOT_ARGS
+#define RE_BOOT_ARGS " "
+#undef  FPC_BOOT_ARGS
+#define FPC_BOOT_ARGS " "
+EVOVPTX_CHASSIS_START_(PTX_CHAS_NAME)
+    EVOVPTX_RE_START_(PTX_CHAS_NAME, EVOVPTX_RE0)
+        EVOVPTX_RE0_INSTANCE_ISO_AUTODISK(PTX_CHAS_NAME, PTX_CHAS_I2CID, {{ vm.disk }}, EVOVPTX_RE0, 0x0CA3, RE_BOOT_ARGS)
+    EVOVPTX_RE_END_
+    EVOVPTX_FPC_START_(PTX_CHAS_NAME, EVOVPTX_FPC0)
+        EVOVPTX_FPC_INSTANCE_DISKLESS(PTX_CHAS_NAME, PTX_CHAS_I2CID, EVOVPTX_RE0, EVOVPTX_FPC0, 0x0D07, FPC_BOOT_ARGS)
+    EVOVPTX_FPC_END_
+    EVOVPTX_FPC_CSPP_START_(PTX_CHAS_NAME, EVOVPTX_FPC0)
+        EVOVPTX_FPC_CSPP_INSTANCE(PTX_CHAS_NAME, EVOVPTX_FPC0, QS_CSPP_IMG)
+        EVOVPTX_INSTALL_FPC_CSPP_BUNDLE_BOWMORE(QS_CSPP_DIR_VBOWMORE)
+        {% for iface in vm.interfaces %}
+        VBOWMORE_CONNECT(IF_ET({{ iface.fpc }}, {{ iface.pic }}, {{ iface.port }}), {{ iface.bridge }})   // {{ iface.name }}
+        {% endfor %}
+    EVOVPTX_FPC_CSPP_END_
+EVOVPTX_CHASSIS_END_
+
+
+
+{# --- CASE 4: 'vrouter' --- #}
 {% elif vm.type == 'vrouter' %}
 #undef VJUNOS_CHASSIS_NAME
 #define VJUNOS_CHASSIS_NAME   {{ vm.hostname }}
@@ -330,7 +561,7 @@ EVOVPTX_CHASSIS_END_
 
 
 
-{# --- CASE 5: Handle 'vswitch' type --- #}
+{# --- CASE 5: 'vswitch' --- #}
 {% elif vm.type == 'vswitch' %}
 #undef VJUNOS_CHASSIS_NAME
 #define VJUNOS_CHASSIS_NAME   {{ vm.hostname }}
@@ -345,20 +576,20 @@ EVOVPTX_CHASSIS_END_
 
 
 
-
-{# --- CASE 6: Handle 'server' type --- #}
+{# --- CASE 6: 'server' --- #}
 {% elif vm.type == 'server' %}
 vm "{{ vm.hostname }}" {
     hostname "{{ vm.hostname }}";
     {% if vm.disk is defined %}
     {{ vm.disk }};
     {% endif %}
-    ncpus {{ vm.ncpus }};
-    memory {{ vm.memory }};
-    
-    {# Servers get a dedicated management interface on em0 #}
+    {# Defaulted so a server without explicit sizing can't render 'ncpus ;',
+       which VMM rejects with a confusing "expecting T_number" pointing at the
+       disk path rather than at the missing field. #}
+    ncpus {{ vm.ncpus | default(2) }};
+    memory {{ vm.memory | default(2048) }};
+
     interface "em0" { bridge "external"; };
-    {# This loop adds data interfaces (em1, em2, etc.) based on the 'links' data #}
     {% for iface in vm.interfaces %}
     interface "{{ iface.name }}" { bridge "{{ iface.bridge }}"; };
     {% endfor %}
@@ -366,7 +597,7 @@ vm "{{ vm.hostname }}" {
 
 
 
-{# --- CASE 7: Handle 'vqfx' type --- #}
+{# --- CASE 7: 'vqfx' --- #}
 {% elif vm.type == 'vqfx' %}
 vm "{{ vm.hostname }}" {
     hostname "{{ vm.hostname }}";
@@ -392,10 +623,9 @@ vm "pecosim{{ vm.hostname }}_FPC" {
     interface "em1" { bridge "pecosim_bridge_{{ vm.hostname }}"; ipaddr "169.254.0.1"; };
 };
 
-
-
-{#  Handle bridges --- #}
 bridge "pecosim_bridge_{{ vm.hostname }}"{};
+{% else %}
+{{ undefined_vm_type_has_no_template_block(vm.type, vm.hostname) }}
 {% endif %}
 
 

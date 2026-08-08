@@ -11,6 +11,8 @@ import os
 import logging
 import pexpect
 import functools
+import signal
+import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from jnpr.junos import Device
@@ -40,6 +42,32 @@ logging.basicConfig(
 DEVICE_ROOT_USER = os.environ.get("VMM_DEVICE_USER", "root")
 DEVICE_ROOT_PASSWORD = os.environ.get("VMM_DEVICE_PASSWORD", "Embe1mpls")
 
+# -----------------------------
+# Serial console prompt patterns
+# -----------------------------
+# These MUST require the 'user@host' part. Junos boot output is full of text a
+# bare '>' / '#' / '%' pattern happily matches, and a false match makes the
+# login state machine think a still-booting device is at a prompt: it stops
+# waiting, fires 'edit' into the boot log, and then hangs forever.
+#
+# Measured against a real 749-line boot log:
+#     r">\s"   -> 40 matches, only 4 of them real prompts. The rest were the
+#                 '-> ' in banner arrows and the newline after '</output>'.
+#     r"#\s"   -> 45 matches, ALL of them '####...#' banner rules.
+#     r"%"     ->  4 matches, none of them prompts.
+# The patterns below match those same 4 real prompts and nothing else.
+#
+# The user part stays permissive and the host part may be empty, because a
+# device that has not applied its hostname yet prompts as 'root@> '.
+PROMPT_OPER = r"[\w.-]+@[\w.-]*>\s"        # Junos operational: user@host>
+PROMPT_CONFIG = r"[\w.-]+@[\w.-]*#\s"      # Junos configuration: user@host#
+PROMPT_SHELL_PCT = r"[\w.-]+@[\w.-]*[^\r\n]{0,20}%\s"   # FreeBSD shell: root@host:~ %
+PROMPT_SHELL_ROOT = r"root@[^\r\n]*#\s"    # Linux/FreeBSD root shell: root@host:~ #
+# A bare '#' shell (the vBugatti/MX304 RE drops you here) only counts at the
+# start of a line, which is what keeps '####...' banners from matching.
+PROMPT_SHELL_BARE = r"(?m)^\r?#\s"
+
+
 # Filesystem locations of helper assets on the QPOD. These default to the
 # original hardcoded paths but can be relocated via VMM_SCRIPTS_DIR (or the
 # per-file overrides) to make the tool portable to another user account.
@@ -62,6 +90,25 @@ FPC_I2CID_MACRO = {
     2: 'VMX_EA_MPC_I2CID',
     3: 'VMX_EA_MPC_I2CID',
     5: 'VMX_XL_MPC_I2CID',
+}
+
+# Each vbugatti (VMX304) chassis needs a distinct VMX304_CHASSIS_I2CID. On the
+# vmm3 pods valfaromeo (MX10008) takes 21, so vbugatti starts at 22 to coexist.
+VBUGATTI_CHASSIS_I2CID_BASE = 22
+
+# --- vmm3 EVO/cosim emission order (LOAD-BEARING) ---------------------------
+# common.evovptx.iface.et.defs installs ~250 unprefixed IF_ET_X_* aliases.
+# RAW connectors (EVOVPTX_CONNECT, LC304_CONNECT) need the alias ALIVE; PREFIXED
+# connectors (VBALERION_/VALFAROMEO_/VBOWMORE_CONNECT) token-paste and
+# need it DEAD. So every RAW chassis is emitted before any PREFIXED one, each
+# PREFIXED block #undef-ing only the aliases it uses, and vbowmore last (it
+# replaces the shared EVOVPTX_* macros via a late include). Non-EVO types are
+# rank 0 (order-independent). See the ninenode.cfg reference header comment.
+VMM3_EMIT_RANK = {
+    'vscapa': 1, 'vardbeg': 1, 'vbrackla': 1, 'vbugatti': 1,   # RAW / self-contained
+    'vbalerion': 2, 'valfaromeo': 2,                           # PREFIXED
+    'vhamilton': 2, 'vmaserati': 2,                            # PREFIXED (vMX10004)
+    'vbowmore': 3,                                             # PREFIXED, must be LAST
 }
 
 def _build_vmx_interface_catalog():
@@ -115,23 +162,63 @@ def _vmx_catalog_hint():
 # the same topology as any member of types_b, because their VMM macro headers
 # collide. Add a new entry here when a new profile brings its own conflicting
 # .defs file - the check in validate_topology() picks it up automatically.
-INCOMPATIBLE_TYPE_GROUPS = [
-    (
-        {'vscapa'}, {'vbrackla'},
-        "their macro headers (common.evovscapa.defs vs. "
-        "common.evovptx.defs/common.brackla.defs) redefine the same macros "
-        "with conflicting values, which makes 'vmm config' fail"
+# The vmm3 EVO / cosim family. Every one of these is built on the vmm3 headers
+# (common.evovptx.defs and friends) and they are proven to coexist in a single
+# file - see the 9-platform ninenode reference. Coexistence relies on two
+# things the template does automatically: emitting RAW-connect chassis before
+# PREFIXED-connect ones (VMM3_EMIT_RANK) and #undef-ing only the unprefixed
+# IF_ET_X_* aliases each PREFIXED block actually consumes.
+VMM3_EVO_TYPES = {
+    'vscapa', 'vardbeg', 'vbrackla', 'vbalerion',
+    'vbowmore', 'valfaromeo',
+}
+
+# Types lab_template.j2 actually knows how to emit. Kept in sync with the
+# {% elif vm.type == ... %} chain in the template - a type missing here (or
+# there) is silently dropped from the generated config, so validate_topology()
+# rejects anything not in this set.
+SUPPORTED_VM_TYPES = {
+    'server', 'vswitch', 'vrouter', 'vqfx',
+    'vmx', 'vferrari', 'vbugatti', 'vhamilton', 'vmaserati',
+    'vscapa', 'vardbeg', 'vbrackla', 'vbalerion',
+    'vbowmore', 'valfaromeo',
+}
+
+# Types that used to be supported but no longer have a template block.
+RETIRED_VM_TYPES = {
+    'vptx': (
+        "the old pre-vmm3 vPTX profile was replaced by the vmm3 EVO PTX types. "
+        "Use 'vardbeg', 'vbowmore', 'vscapa', 'vbrackla' or 'vbalerion' instead "
+        "(they interoperate in a single lab; vptx did not)"
     ),
-    (
-        {'valfaromeo'}, {'vptx', 'vscapa', 'vbrackla'},
-        "vAlfaRomeo ships its own common.vptx.defs "
-        "(/vmm/data/user_disks/dhahm/valfaromeo/) which defines the VPTX_* "
-        "chassis macros and IF_ET_CHAN differently from the standard "
-        "/vmm/data/vmm-configs/common/vmxc/common.vptx.defs. With both in one "
-        "file the wrong IF_ET_CHAN wins and VALFAROMEO_CONNECT emits an "
-        "invalid interface name such as 'VALFAROMEO_eth4'"
+    'vredbull': (
+        "removed - the profile did not come up reliably and is no longer "
+        "generated. Use another channelized type such as 'valfaromeo', or one "
+        "of the vMX10004 linecards ('vhamilton', 'vmaserati')"
     ),
-]
+}
+
+# Pairs of type groups that cannot share one generated config.
+#
+# EMPTY ON PURPOSE - every supported type now mixes freely.
+#
+# This used to hold {'vhamilton'} x VMM3_EVO_TYPES. vHamilton (and vMaserati)
+# build their vNIC name by token-pasting their own prefix onto the IF_ET
+# argument, e.g. VHAMILTON_CONNECT(IF_ET(0,0,0), b) -> CATENATE(VHAMILTON_, <arg>).
+# cpp fully expands the argument first, so while the vmm3 EVO headers' ~250
+# unprefixed IF_ET_X_* aliases are live the argument becomes 'eth4' and the paste
+# yields the bogus name 'VHAMILTON_eth4'.
+#
+# That is now handled structurally instead of by exclusion, and verified on the
+# pod with 'cpp -P':
+#   * VMM3_EMIT_RANK puts every RAW-connect chassis (rank 1, needs the aliases
+#     ALIVE) ahead of every PREFIXED one (rank 2/3, needs them DEAD), and
+#   * each PREFIXED block '#undef's exactly the IF_ET_X_<pic>_<port> aliases it
+#     is about to consume, immediately before its own *_CONNECT lines.
+# Measured result in a single config: EVO -> 'eth13', vHamilton -> 'eth4'/'eth5'.
+# _assert_prefixed_aliases_are_undefed() re-checks this on every generate, so a
+# regression fails at generation time instead of after a deploy.
+INCOMPATIBLE_TYPE_GROUPS = []
 
 # -----------------------------
 # Topology Validation Function
@@ -146,6 +233,24 @@ def validate_topology(data):
     # Use a dictionary comprehension for quick VM lookup
     vms_by_hostname = {vm['hostname']: vm for vm in data.get('vms', [])}
 
+    # 0. Lab name.
+    # The template emits TOPOLOGY_START({{ lab_name }}), which becomes
+    # 'config "<name>" {'. With the key missing or blank that expands to
+    # 'config "" {' and VMM rejects the whole file with an unhelpful
+    # "syntax error, unexpected T_number, expecting '{'" pointing at an
+    # unrelated line, so catch it here where the cause is obvious.
+    lab_name = str(data.get('lab_name') or "").strip()
+    if not lab_name:
+        errors.append(
+            "Missing top-level 'lab_name'. Add e.g. \"lab_name: MY-LAB\" - "
+            "it names the VMM config, and without it the generated file is rejected."
+        )
+    elif not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", lab_name):
+        errors.append(
+            f"lab_name '{lab_name}' is not a valid VMM config name. Use letters, "
+            f"digits, '-' or '_', starting with a letter."
+        )
+
     # 0. Mutually Exclusive VM Type Check
     # Several profiles ship VMM macro headers that #define the same macro
     # names with conflicting values. Including two of them in one generated
@@ -153,6 +258,25 @@ def validate_topology(data):
     # to something invalid), so catch the combination here instead of letting
     # it fail later on the VMM host.
     present_types = {vm.get('type') for vm in data.get('vms', [])}
+
+    # 0a. Unknown / retired VM type check.
+    # lab_template.j2 dispatches on vm.type through a chain of {% elif %} with no
+    # {% else %}, so a type it does not know emits *nothing at all* - the VM block
+    # is silently dropped while its links still reference it, producing a config
+    # that looks fine but is wired to a device that does not exist. Fail loudly.
+    for vm in data.get('vms', []):
+        vm_type = vm.get('type')
+        if vm_type in RETIRED_VM_TYPES:
+            errors.append(
+                f"VM '{vm.get('hostname')}' uses retired type '{vm_type}': "
+                f"{RETIRED_VM_TYPES[vm_type]}"
+            )
+        elif vm_type not in SUPPORTED_VM_TYPES:
+            errors.append(
+                f"VM '{vm.get('hostname')}' has unknown type '{vm_type}'. "
+                f"Supported types: {', '.join(sorted(SUPPORTED_VM_TYPES))}."
+            )
+
     for group_a, group_b, reason in INCOMPATIBLE_TYPE_GROUPS:
         hit_a = sorted(group_a & present_types)
         hit_b = sorted(group_b & present_types)
@@ -167,7 +291,9 @@ def validate_topology(data):
     for vm in data.get('vms', []):
         vm_type = vm.get('type')
         disk_alias = vm.get('disk')
-        if vm_type in ('vmx', 'vqfx', 'vptx', 'vferrari', 'valfaromeo'):
+        if vm_type in ('vmx', 'vqfx', 'vferrari', 'valfaromeo', 'vbugatti',
+                       'vhamilton', 'vmaserati', 'vbalerion', 'vscapa',
+                       'vbrackla', 'vardbeg', 'vbowmore'):
             # Use a single check for all supported types. The template keys off
             # this prefix to decide how the '#define' is emitted, so it is not
             # merely cosmetic.
@@ -175,24 +301,87 @@ def validate_topology(data):
                 errors.append(f"VM '{vm['hostname']}' (type: {vm_type}) uses disk '{disk_alias}'. Disk alias must start with '{vm_type}'.")
 
     # Prepare for interface checks
+    # WHERE THESE RANGES COME FROM (do not widen them from the alias tables!)
+    # ---------------------------------------------------------------------
+    # For the vmm3 EVO platforms the IF_ET_X_0_<port> alias tables are a
+    # SUPERSET of the ports Junos actually exposes. The real port list is set
+    # by the platform's CSPP/cosim config, which maps host vNICs to PFE ports:
+    #     /vmm/data/vmm-configs/common/vptxc/cspp_cfg/<PLATFORM>/*_cspp.conf*
+    # Its "Interfaces mapping" section lists eth1 (the LCPU host port, not a
+    # data port) followed by the data vNICs. The generator instantiates ONE
+    # CSPP/PFE per chassis, so the valid set comes from conf.0, and:
+    #
+    #     Junos et-<fpc>/0/<N>   <->   IF_ET_X_<pic>_<N>   <->   eth<N+4>
+    #
+    # Verified against live devices: vScapa/vBowmore eth5,7,..,19 -> odd 1-15;
+    # vBalerion eth13..30 -> 9-26; vArdbeg eth4..15 -> 0-11; vBrackla eth4..8
+    # -> 0-4. Wiring a port outside this set is NOT a config error - VMM
+    # happily builds the bridge and the vNIC, but no Junos interface is ever
+    # bound to it, so the link is silently dead (peer shows link-up, no
+    # traffic, no LLDP neighbour). That bug cost a full deployment cycle.
     interface_patterns = {
         'vrouter': re.compile(r'^ge-0/0/\d+$'),
         'vswitch': re.compile(r'^ge-0/0/\d+$'),
         'vqfx': re.compile(r'^xe-0/0/\d+$'),
         'server': re.compile(r'^em\d+$'),
-        'vscapa': re.compile(r'^et-0/0/\d+$'),
-        'vptx' : re.compile(r'^et-0/0/\d+:[0-3]$'), # vptx check: enforces et-0/0/PORT:SUB where SUB is 0-3
-        # vbrackla's IF_ET macro only takes fpc/pic/port (no subport arg), but
-        # the interface is actually exposed to Junos as et-1/0/<port>:0 - the
-        # subport is fixed at 0, never channelized further.
-        'vbrackla': re.compile(r'^et-1/0/\d+:0$'),
+        # vScapa (vmm3 EVOvScapa): RAW EVOVPTX_CONNECT(IF_ET(0,0,<port>)).
+        # Junos exposes only the 8 ODD ports et-0/0/1,3,5,7,9,11,13,15
+        # (verified on a live vScapa). The shared IF_ET_X_0_<port> alias table
+        # runs 0-35, but any port outside that odd set is never bound inside
+        # Junos: VMM still builds the bridge and the vNIC, so the peer sees
+        # link-up while no traffic passes -> silently dead link.
+        'vscapa': re.compile(r'^et-0/0/(1|3|5|7|9|11|13|15)$'),
+        # vBrackla (vmm3): FPC1, RAW EVOVPTX_CONNECT(IF_ET(1,0,<port>)) -> et-1/0/<port>
+        # (no channel suffix on vmm3; the reference wires et-1/0/0). Only 5 data
+        # ports: its CSPP config (EVOvBRACKLA/COSIMPP/vbrackla_cspp.conf, named
+        # by BRACKLACHAN in common.brackla.defs) maps eth4..eth8 -> et-1/0/0..4.
+        'vbrackla': re.compile(r'^et-1/0/[0-4]$'),
         # vFerrari: 5 fixed 100G ports on FPC0, not channelized. Emitted as
         # VMX_CONNECT(ET(fpc,pic,port,0), ...) - same macro family as vmx.
         'vferrari': re.compile(r'^et-0/0/[0-4]$'),
-        # vAlfaRomeo: 4 ports x 4 channelized subports per FPC, on FPC0 and
-        # FPC1. Emitted as VALFAROMEO_CONNECT(IF_ET_CHAN(fpc,pic,port,subport)),
-        # one VALFAROMEO_FPC block per FPC used.
-        'valfaromeo': re.compile(r'^et-[01]/0/[0-3]:[0-3]$'),
+        # vBugatti (vMX304 + LC304): 16 x 100G ports on FPC0, numbered 0-15.
+        # Verified on a live vBugatti, and the LC304_IF_ET_100G_X_0_<port>
+        # alias table is likewise 0-15. Emitted as
+        # LC304_CONNECT(LC304_IF_ET_100G(0,0,<port>), ...).
+        'vbugatti': re.compile(r'^et-0/0/([0-9]|1[0-5])$'),
+        # vHamilton (vMX10004 + vHamilton LCs): 14 ports per linecard, numbered
+        # from 0 (et-<fpc>/0/0 .. et-<fpc>/0/13), on up to 3 linecards FPC0-FPC2.
+        # Emitted as VHAMILTON_CONNECT(IF_ET(<fpc>,0,<port>), ...), one
+        # VHAMILTON_FPC block per FPC used (same shape as vAlfaRomeo).
+        'vhamilton': re.compile(r'^et-[0-2]/0/([0-9]|1[0-3])$'),
+        # vMaserati (vMX10004 + vMaserati LC, "XT"): TWO pics on one linecard -
+        # pic0 has 20 ports (et-<fpc>/0/0 .. et-<fpc>/0/19) and pic1 has 16
+        # (et-<fpc>/1/0 .. et-<fpc>/1/15). Unlike the EVO/CSPP platforms the full
+        # alias table really is wired: the shipped reference topology
+        # /vmm/data/user_disks/vmaserati/vmaserati-1router-mx10k4.config connects
+        # all 36 of them, so this range is the vendor's own list, not a guess.
+        # Alias mapping is VMASERATI_IF_ET_X_0_N -> vio<N+4> and
+        # VMASERATI_IF_ET_X_1_N -> vio<N+24> (vio, not eth).
+        # Emitted as VMASERATI_CONNECT(IF_ET(<fpc>,<pic>,<port>), ...) with the
+        # matching '#undef IF_ET_X_<pic>_<port>' - same PREFIXED handling as
+        # vHamilton/vAlfaRomeo.
+        'vmaserati': re.compile(r'^et-[0-2]/(0/([0-9]|1[0-9])|1/([0-9]|1[0-5]))$'),
+        # vBalerion (vmm3 EVO PTX): FPC0 linecard, ports et-0/0/9 .. et-0/0/26.
+        # Emitted as VBALERION_CONNECT(IF_ET(0,0,<port>), ...); the template also
+        # emits '#undef IF_ET_X_0_<port>' per port so the prefix-paste doesn't
+        # expand the unprefixed alias into junk (VBALERION_eth13).
+        'vbalerion': re.compile(r'^et-0/0/(9|1[0-9]|2[0-6])$'),
+        # vAlfaRomeo: 4 ports x 4 channelized subports per FPC, on FPC0, FPC1
+        # and FPC2 (up to 3 linecards). Emitted as
+        # VALFAROMEO_CONNECT(IF_ET_CHAN(fpc,pic,port,subport)), one
+        # VALFAROMEO_FPC block per FPC used.
+        'valfaromeo': re.compile(r'^et-[0-2]/0/[0-3]:[0-3]$'),
+        # vArdbeg (vmm3 EVO PTX): RAW connect - EVOVPTX_CONNECT(IF_ET(0,0,<port>)).
+        # The shared unprefixed IF_ET_X_0_<port> table runs to 35, but Junos
+        # only exposes et-0/0/0 .. et-0/0/11 (12 contiguous ports, verified on
+        # a live vArdbeg). Ports 12-35 exist as aliases only -> dead links.
+        'vardbeg': re.compile(r'^et-0/0/([0-9]|1[01])$'),
+        # vBowmore (vmm3 EVO PTX): PREFIXED connect - VBOWMORE_CONNECT pastes
+        # onto IF_ET_X_0_<port>. Same port layout as vScapa: Junos exposes only
+        # the 8 ODD ports et-0/0/1,3,...,15 (verified on a live vBowmore; its
+        # alias table is byte-identical to vScapa's). An even port yields a
+        # silently dead link - this is exactly what broke a real deployment.
+        'vbowmore': re.compile(r'^et-0/0/(1|3|5|7|9|11|13|15)$'),
     }
     vm_interfaces = defaultdict(list)
 
@@ -232,76 +421,47 @@ def validate_topology(data):
         # These types draw from a fixed hardware interface catalog rather than
         # a growable range, so the sequential-numbering rule below does not
         # apply - any subset of the valid interfaces may be used, in any order.
+        # (Gaps are proven safe: the pod-validated vBalerion reference wires
+        # et-0/0/9 and et-0/0/18 with nothing in between.) The exact valid set
+        # per type is enforced by interface_patterns above; the ranges below
+        # were verified against live devices, not inferred from alias tables.
         #   vmx        - see VMX_INTERFACE_CATALOG (sparse, multi-FPC)
         #   vferrari   - et-0/0/0 .. et-0/0/4
-        #   valfaromeo - et-0/0/0:0 .. et-0/0/3:3
-        if vm_type in ('vmx', 'vferrari', 'valfaromeo'):
+        #   valfaromeo - et-<0-2>/0/0:0 .. et-<0-2>/0/3:3  (FPC0-FPC2)
+        #   vbugatti   - et-0/0/0 .. et-0/0/15   (16 ports, 0-based)
+        #   vhamilton  - et-<0-2>/0/0 .. et-<0-2>/0/13  (FPC0-FPC2)
+        #   vbalerion  - et-0/0/9 .. et-0/0/26   (18 ports, starts at 9)
+        #   vardbeg    - et-0/0/0 .. et-0/0/11   (12 ports)
+        #   vbowmore   - et-0/0/1,3,5,7,9,11,13,15   (8 ports, ODD only)
+        #   vscapa     - et-0/0/1,3,5,7,9,11,13,15   (8 ports, ODD only)
+        #   vbrackla   - et-1/0/0 .. et-1/0/4    (5 ports, FPC1)
+        if vm_type in ('vmx', 'vferrari', 'valfaromeo', 'vbugatti', 'vhamilton',
+                       'vmaserati', 'vbalerion', 'vardbeg', 'vbowmore',
+                       'vscapa', 'vbrackla'):
             continue
 
         numbers = []
-        is_vscapa = (vm_type == 'vscapa')
-        is_vptx = (vm_type == 'vptx')
-        
         try:
-            if is_vptx:
-                # vptx (et-0/0/PORT:SUB) - Combine PORT and SUB into a single index for sequencing
-                # Index = (Port Index * 4) + Sub-Interface Index (since 4 sub-interfaces: 0, 1, 2, 3)
-                for iface in ifaces:
-                    # Extracts components based on '-', '/' and ':' delimiters.
-                    # NB: the '-' must be first (or escaped) in the character
-                    # class - '[/-:]' is a *range* (/ 0x2F .. : 0x3A) that
-                    # matches every digit, which silently broke this check.
-                    parts = re.split(r'[-/:]', iface)
-                    port = int(parts[3]) # The PORT number (e.g., 0 in et-0/0/0:0)
-                    sub = int(parts[4])  # The SUB number (e.g., 0 in et-0/0/0:0)
-                    
-                    numbers.append(port * 4 + sub)
-                numbers.sort()
-            
-            elif vm_type == 'vbrackla':
-                # vbrackla (et-1/0/PORT:0) - subport is always 0, so only the
-                # port index needs to be sequential. Strip the ":0" before
-                # converting to int.
-                numbers = sorted([int(iface.split('/')[-1].split(':')[0]) for iface in ifaces])
-
-            elif vm_type in ['vrouter', 'vswitch', 'vmx', 'vqfx', 'vscapa']:
-                # Standard interfaces: extract the last number (the port index)
-                # Split by '/' and take the last element, then convert to int.
+            if vm_type in ['vrouter', 'vswitch', 'vqfx']:
+                # Growable ge-/xe- ranges: extract the last number (port index).
                 numbers = sorted([int(iface.split('/')[-1]) for iface in ifaces])
-
             elif vm_type == 'server':
                 # Server interfaces: extract number after 'em'
                 numbers = sorted([int(iface[2:]) for iface in ifaces if iface.startswith('em')])
-        
         except (ValueError, IndexError):
             # Should only happen if regex validation fails to catch a malformed string
-            continue 
+            continue
 
-        # --- Sequential Check ---
+        # --- Sequential Check (only the growable ge-/xe-/em ranges) ---
         if numbers:
-            if is_vscapa:
-                # vscapa check: must use sequential odd numbers starting at 1 (1, 3, 5, ...)
-                expected_sequence = [1 + 2 * i for i in range(len(numbers))]
-                if numbers != expected_sequence:
-                    errors.append(f"Interface numbering for vscapa '{hostname}' must start at 'et-0/0/1' and use sequential odd numbers. Expected port indices {expected_sequence}, but found {numbers}.")
-            
-            elif is_vptx:
-                # vptx check: combined index must be sequential starting from 0 (0, 1, 2, 3, ...)
-                start_index = 0
-                expected_sequence = list(range(start_index, start_index + len(numbers)))
-                if numbers != expected_sequence:
-                    errors.append(f"Channelized interface numbering for vptx '{hostname}' must start at 'et-0/0/0:0' and be sequential. Expected combined indices {expected_sequence}, but found {numbers}.")
-            
-            else: # All other standard types (vrouter, vswitch, vmx, vqfx, server)
-                # Start index is 1 for 'server' (em1), 0 for others (ge-0/0/0, etc.)
-                start_index = 1 if vm_type == 'server' else 0
-                expected_sequence = list(range(start_index, start_index + len(numbers)))
-                
-                if numbers != expected_sequence:
-                    if vm_type == 'server':
-                         errors.append(f"Interface numbering for server '{hostname}' must start at 'em1' and be sequential. Expected port indices {expected_sequence}, but found {numbers}.")
-                    else:
-                         errors.append(f"Interface numbering for device '{hostname}' must start at index {start_index} and be sequential. Expected port indices {expected_sequence}, but found {numbers}.")
+            # Start index is 1 for 'server' (em1), 0 for others (ge-0/0/0, etc.)
+            start_index = 1 if vm_type == 'server' else 0
+            expected_sequence = list(range(start_index, start_index + len(numbers)))
+            if numbers != expected_sequence:
+                if vm_type == 'server':
+                    errors.append(f"Interface numbering for server '{hostname}' must start at 'em1' and be sequential. Expected port indices {expected_sequence}, but found {numbers}.")
+                else:
+                    errors.append(f"Interface numbering for device '{hostname}' must start at index {start_index} and be sequential. Expected port indices {expected_sequence}, but found {numbers}.")
 
     # Final error reporting
     if errors:
@@ -376,6 +536,67 @@ def add_sniffers_to_topology(data,quiet=False):
 
     data['links'] = new_links
     return data, sniffer_vm_name, capture_mappings
+
+
+# -----------------------------
+# Post-render safety net: PREFIXED connectors must have their alias killed
+# -----------------------------
+# Connectors that build the vNIC name by token-pasting their own prefix onto the
+# argument, i.e. VBALERION_CONNECT(IF_ET(0,0,9), b) -> CATENATE(VBALERION_, <arg>).
+# cpp fully macro-expands the argument first, so if the unprefixed alias
+# IF_ET_X_<pic>_<port> is still live (the vmm3 EVO headers define ~250 of them)
+# the argument becomes 'eth13' and the paste yields the bogus name
+# 'VBALERION_eth13'. VMM accepts that silently: the bridge and the vNIC are still
+# created, but no Junos interface is ever bound to them, so the link looks up on
+# the peer yet passes no traffic and shows no LLDP neighbour. Each PREFIXED block
+# therefore has to '#undef' the exact alias it is about to use.
+#
+# The alias is keyed by PIC, never FPC - verified on the pod:
+#     #define IF_ET(FPC, PIC, PORT)        CATENATE(IF_ET_X_, CATENATE3(PIC, _, PORT))
+#     #define IF_ET_CHAN(FPC,PIC,PORT,CH)  CATENATE(IF_ET_X_, CATENATE5(PIC, _, PORT, _, CH))
+# IF_ET(1,0,0) and IF_ET(0,0,0) are both eth4; IF_ET(0,1,0) is eth16.
+PREFIXED_CONNECTORS = ("VBALERION", "VBOWMORE", "VALFAROMEO", "VHAMILTON", "VMASERATI")
+
+_PREFIXED_CONNECT_RE = re.compile(
+    r"^\s*(?P<prefix>" + "|".join(PREFIXED_CONNECTORS) + r")_CONNECT\(\s*"
+    r"IF_ET(?P<chan>_CHAN)?\(\s*(?P<args>[^)]*)\)",
+    re.MULTILINE,
+)
+
+
+def _assert_prefixed_aliases_are_undefed(rendered):
+    """Fail loudly if a PREFIXED *_CONNECT is emitted while its IF_ET_X alias is live.
+
+    Catches the 'VBALERION_eth13' silent-dead-link class at generation time rather
+    than after a multi-hour deploy. Only '#undef' lines that appear *before* the
+    connector count, since cpp is order sensitive.
+    """
+    problems = []
+    for m in _PREFIXED_CONNECT_RE.finditer(rendered):
+        args = [a.strip() for a in m.group("args").split(",")]
+        # IF_ET(fpc, pic, port) / IF_ET_CHAN(fpc, pic, port, chan) -> alias drops fpc
+        expected_len = 4 if m.group("chan") else 3
+        if len(args) != expected_len or not all(a.isdigit() for a in args):
+            continue
+        alias = "IF_ET_X_" + "_".join(args[1:])
+        preceding = rendered[: m.start()]
+        if f"#undef {alias}\n" not in preceding:
+            line_no = preceding.count("\n") + 1
+            problems.append(
+                f"  line {line_no}: {m.group('prefix')}_CONNECT would expand to "
+                f"'{m.group('prefix')}_<vnic>' because '#undef {alias}' is missing above it"
+            )
+
+    if problems:
+        raise ValueError(
+            "Internal template error - PREFIXED connector emitted without killing its "
+            "IF_ET_X alias.\n"
+            + "\n".join(problems)
+            + "\n\nThis would produce a link that comes up on the peer but carries no "
+            "traffic. Fix lab_template.j2 so the block emits "
+            "'#undef IF_ET_X_<pic>_<port>[_<subport>]' (keyed by PIC, not FPC) for "
+            "every interface before its *_CONNECT lines."
+        )
 # -----------------------------
 # Generate VMM config
 # -----------------------------
@@ -503,6 +724,16 @@ def generate_config(topology_file, output_file, quiet=False):
             for fpc, ifaces in sorted(fpc_map.items())
         ]
 
+    # --- Assign a unique chassis I2C id to each vbugatti (VMX304) VM ---
+    # Every VMX304 chassis in one file needs a distinct VMX304_CHASSIS_I2CID
+    # (the reference config uses 21, 22, ... for successive instances), so
+    # number them in topology order starting at VBUGATTI_CHASSIS_I2CID_BASE.
+    vbugatti_ordinal = 0
+    for vm in data.get('vms', []):
+        if vm.get('type') == 'vbugatti':
+            vm['chassis_i2cid'] = VBUGATTI_CHASSIS_I2CID_BASE + vbugatti_ordinal
+            vbugatti_ordinal += 1
+
     # --- Build the comprehensive summary list for the output table ---
     sniffed_link_map = {m['link']: m['capture_point'] for m in capture_mappings}
     final_summary_mappings = []
@@ -514,13 +745,33 @@ def generate_config(topology_file, output_file, quiet=False):
             capture_point = sniffed_link_map.get(link_str, "")
             final_summary_mappings.append({'link': link_str, 'capture_point': capture_point})
 
+    # --- Emit VMs in vmm3 family order (RAW -> PREFIXED -> vbowmore last) ---
+    # Stable sort keeps topology order within each rank. This only affects the
+    # order chassis blocks are written to the .conf; links/bridges are unchanged.
+    data['vms'] = sorted(data.get('vms', []),
+                         key=lambda vm: VMM3_EMIT_RANK.get(vm.get('type'), 0))
+
     # --- Finalize data and generate the VMM config file ---
     all_vm_types = {vm.get('type') for vm in data.get('vms', [])}
     data['types'] = list(all_vm_types)
 
     env = Environment(loader=FileSystemLoader("."), trim_blocks=True, lstrip_blocks=True)
+
+    def _unsupported_type(vm_type, hostname):
+        # Reached only if lab_template.j2's {% elif vm.type == ... %} chain has
+        # no branch for this type. Without this the VM would be silently omitted
+        # from the config while its links still point at it.
+        raise ValueError(
+            f"VM '{hostname}' has type '{vm_type}', which lab_template.j2 has no "
+            f"block for. Add a template case (and list the type in "
+            f"SUPPORTED_VM_TYPES) before using it."
+        )
+
+    env.globals['undefined_vm_type_has_no_template_block'] = _unsupported_type
     template = env.get_template("lab_template.j2")
     output = template.render(data)
+
+    _assert_prefixed_aliases_are_undefed(output)
 
     with open(output_file, "w") as f:
         f.write(output)
@@ -533,30 +784,247 @@ def generate_config(topology_file, output_file, quiet=False):
 # Apply VMM config and start lab
 # -----------------------------
 
-def run_vmm_config(config_file):
+# Markers VMM prints on its own stdout/stderr when something went wrong.
+# 'vmm config' exits 2 on a missing disk, but it exits 0 for a lab that is far
+# too large for the pod (verified: a 900 GB VM is accepted with "write_config
+# complete"), so exit codes alone are NOT a reliable success signal.
+VMM_FAILURE_MARKERS = (
+    "command FAILED",
+    "Fatal error",
+    "fatal error",
+    "syntax error",
+    "does not exist",
+    "No config active",
+    "not enough",
+    "Cannot allocate",
+)
+
+
+def _run_vmm(args, timeout=900):
+    """Run a 'vmm ...' command capturing output. Returns (returncode, output)."""
+    try:
+        p = subprocess.run(["vmm"] + args, stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT, text=True, timeout=timeout)
+        return p.returncode, (p.stdout or "")
+    except FileNotFoundError:
+        return 127, "'vmm' command not found on this host (are you on the -vmm pod server?)"
+    except subprocess.TimeoutExpired:
+        return 124, f"'vmm {' '.join(args)}' timed out after {timeout}s"
+
+
+def _show_vmm_output(output, limit=15):
+    """Echo the tail of VMM's own output so the real error is visible."""
+    lines = [l for l in (output or "").splitlines() if l.strip()]
+    if not lines:
+        return
+    print("   ── vmm output " + "─" * 46)
+    for line in lines[-limit:]:
+        print(f"   │ {line}")
+    print("   " + "─" * 60)
+
+
+def get_vmm_capacity():
+    """
+    Parse 'vmm capacity -g vmm-default'. Values are in GB (a pod's total
+    tracks blades x 64 GB). Returns a dict or None if it cannot be read.
+
+    'largest' is the biggest single VM that still fits on any one blade - a
+    32 GB FPC needs largest >= 32 even when total free capacity looks ample.
+    """
+    rc, out = _run_vmm(["capacity", "-g", "vmm-default"], timeout=120)
+    if rc != 0:
+        return None
+    fields = {"Total capacity": "total", "Utilized capacity": "utilized",
+              "Free capacity": "free", "Current largest VM available": "largest"}
+    caps = {}
+    for line in out.splitlines():
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        name = fields.get(key.strip())
+        if name:
+            try:
+                caps[name] = int(val.strip())
+            except ValueError:
+                pass
+    return caps if "free" in caps and "largest" in caps else None
+
+
+def _expand_config(config_file):
+    """
+    Pre-process a VMM config the way VMM does. Most VMs (and their memory
+    values) are produced by macros, so the raw file only mentions a handful of
+    them literally - anything inspecting the config has to expand it first.
+    'common.site.defs' is not a real file on the pod, so an empty stub stands
+    in for it (it defines no VMs or memory values).
+
+    Returns the expanded text, or None if it cannot be expanded.
+    """
+    try:
+        with tempfile.TemporaryDirectory() as stub:
+            open(os.path.join(stub, "common.site.defs"), "w").close()
+            p = subprocess.run(["cpp", "-P", "-I", stub, config_file],
+                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               text=True, timeout=120)
+            return p.stdout if p.returncode == 0 and p.stdout else None
+    except Exception:
+        return None
+
+
+def get_lab_requirements(config_file):
+    """
+    Measure what the generated lab needs.
+
+    Returns (total_gb, max_vm_gb, vm_count) or None if it cannot be measured.
+    """
+    expanded = _expand_config(config_file)
+    if not expanded:
+        return None
+    blocks = re.split(r'vm\s+"([^"]+)"\s*\{', expanded)
+    sizes = []
+    for i in range(1, len(blocks), 2):
+        m = re.search(r"memory\s+(\d+)", blocks[i + 1])
+        if m:
+            sizes.append(int(m.group(1)) // 1024)
+    if not sizes:
+        return None
+    return sum(sizes), max(sizes), len(sizes)
+
+
+def preflight_capacity_check(config_file, force=False):
+    """
+    Compare what the lab needs against what the pod can actually host, BEFORE
+    unbinding anything. 'vmm config' does not check capacity, so without this
+    an oversized lab tears down the running lab and then silently fails to
+    bind. Advisory only: if either side cannot be measured, we proceed.
+    """
+    need = get_lab_requirements(config_file)
+    caps = get_vmm_capacity()
+    if not need or not caps:
+        return
+    total_gb, max_vm_gb, vm_count = need
+    print(f"Lab needs {total_gb} GB across {vm_count} VMs "
+          f"(largest single VM {max_vm_gb} GB); pod has {caps['free']} GB free, "
+          f"largest free slot {caps['largest']} GB.")
+
+    problems = []
+    if max_vm_gb > caps["largest"]:
+        problems.append(
+            f"largest VM is {max_vm_gb} GB but the biggest free slot on any "
+            f"blade is {caps['largest']} GB")
+    if total_gb > caps["free"]:
+        problems.append(
+            f"lab totals {total_gb} GB but only {caps['free']} GB is free")
+    if not problems:
+        return
+
+    print("\n❌ This lab cannot fit on this pod:", file=sys.stderr)
+    for p in problems:
+        print(f"   • {p}", file=sys.stderr)
+    print("\n   Nothing has been changed - your current lab is untouched.\n"
+          "   Options:\n"
+          "     • deploy a smaller subset of the topology\n"
+          "     • free capacity, or try another pod\n"
+          "     • re-run with --force to attempt it anyway", file=sys.stderr)
+    if not force:
+        sys.exit(1)
+    print("⚠️  --force given: continuing despite the capacity shortfall.",
+          file=sys.stderr)
+
+
+def verify_lab_running(config_file):
+    """
+    Confirm the lab actually materialised. 'vmm start' can exit 0 while nothing
+    was bound (e.g. an orphaned lab still holds the capacity), which used to be
+    reported as success and then wasted the whole boot wait followed by an
+    endless serial-console retry loop against VMs that do not exist.
+
+    Returns a list of problem strings (empty when the lab is really up).
+    """
+    expanded = _expand_config(config_file)
+    if expanded is None:
+        # Fall back to the raw file; it names only the literal VMs, so the
+        # "absent" check is skipped rather than reporting false positives.
+        expected = set()
+    else:
+        expected = set(re.findall(r'vm\s+"([^"]+)"\s*\{', expanded))
+
+    rc, out = _run_vmm(["ls"], timeout=180)
+    problems = []
+    if rc != 0:
+        return [f"'vmm ls' failed (exit {rc})"]
+    if "No config active" in out:
+        problems.append("VMM reports 'No config active' - the config never took effect")
+
+    listed = {line.split("\t")[0].strip() for line in out.splitlines() if line.strip()}
+    missing = sorted(n for n in expected if n not in listed)
+    if missing:
+        shown = ", ".join(missing[:6]) + ("..." if len(missing) > 6 else "")
+        problems.append(f"{len(missing)}/{len(expected)} configured VMs are absent: {shown}")
+
+    orphans = [l.split("VM", 1)[-1].split("on server")[0].strip()
+               for l in out.splitlines() if "not in current config" in l]
+    if orphans:
+        shown = ", ".join(orphans[:6]) + ("..." if len(orphans) > 6 else "")
+        problems.append(f"{len(orphans)} VM(s) from a previous lab still on the server: {shown}")
+    return problems
+
+
+def run_vmm_config(config_file, force=False):
     """Applies the VMM config and starts the lab."""
     print("\n" + "="*50)
     print(" 🚀 Phase 2: Starting the Lab")
     print("="*50)
-    try:
-        print("Perfoming VMM unbind")
-        subprocess.run(["vmm", "unbind"],stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("Applying vmm config!")
-        subprocess.run(["vmm", "config", config_file, "-g", "vmm-default"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"❌ Failed to apply VMM config: {e}", file=sys.stderr)
+
+    preflight_capacity_check(config_file, force=force)
+
+    print("Perfoming VMM unbind")
+    rc, out = _run_vmm(["unbind"])
+    if rc != 0:
+        # Not fatal on its own (there may be nothing bound), but a failed
+        # unbind leaves the old lab holding capacity, so never hide it.
+        print(f"⚠️  'vmm unbind' returned {rc} - the previous lab may still "
+              f"be holding capacity.", file=sys.stderr)
+        _show_vmm_output(out)
+
+    print("Applying vmm config!")
+    rc, out = _run_vmm(["config", config_file, "-g", "vmm-default"])
+    failed = [m for m in VMM_FAILURE_MARKERS if m in out]
+    if rc != 0 or failed:
+        print(f"❌ Failed to apply VMM config (exit {rc}).", file=sys.stderr)
+        _show_vmm_output(out)
         sys.exit(1)
 
-    try:
-        subprocess.run(["vmm", "start"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print("✅ VMM lab started!")
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        print(f"❌ Failed to start VMM lab: {e}", file=sys.stderr)
+    rc, out = _run_vmm(["start"])
+    if rc != 0:
+        print(f"❌ Failed to start VMM lab (exit {rc}).", file=sys.stderr)
+        _show_vmm_output(out)
         sys.exit(1)
+
+    problems = verify_lab_running(config_file)
+    if problems:
+        print("\n❌ VMM reported success but the lab is not actually running:",
+              file=sys.stderr)
+        for p in problems:
+            print(f"   • {p}", file=sys.stderr)
+        caps = get_vmm_capacity()
+        if caps:
+            print(f"\n   Pod capacity: {caps['free']} GB free, largest free "
+                  f"slot {caps['largest']} GB.", file=sys.stderr)
+        print("\n   This is usually an orphaned lab still holding capacity, or\n"
+              "   not enough room to place the VMs. Check with:\n"
+              "       vmm ls\n"
+              "       vmm capacity -g vmm-default\n"
+              "   Stopping here rather than waiting for devices that will "
+              "never boot.", file=sys.stderr)
+        sys.exit(1)
+
+    print("✅ VMM lab started!")
 # -----------------------------
 # Monitor devices with 'vmm ping'
 # -----------------------------
-def monitor_vms(devices, timeout=900, stall_timeout=60, poll_interval=5):
+def monitor_vms(devices, timeout=900, stall_timeout=60, poll_interval=5,
+                no_response_timeout=420):
     """
     Wait until the devices we are about to configure report 'alive' in
     'vmm ping', then let Phase 4 proceed. `devices` is a list of
@@ -583,57 +1051,74 @@ def monitor_vms(devices, timeout=900, stall_timeout=60, poll_interval=5):
     print(f"\U0001f4e1 Waiting for {len(targets)} routing engine(s) to boot: "
           f"{', '.join(sorted(targets))}")
 
+    print("(devices are still configured over serial afterwards, which waits "
+          "for boot on its own - press Ctrl+C to skip this wait)")
+
     total = len(targets)
     start_time = time.time()
     last_alive_count = -1
-    last_progress_time = start_time
+    last_change = start_time
+    last_poll = 0.0
+    alive = set()
     bar_length = 40
+    spin = "|/-\\"
 
-    def draw(alive_count):
+    def draw(alive_count, elapsed):
         pct = alive_count / total
         filled = int(bar_length * pct)
         bar = "█" * filled + "-" * (bar_length - filled)
-        sys.stdout.write(f"\r[{bar}] {alive_count}/{total} Booted ({pct:.0%})   ")
+        s = spin[int(elapsed) % 4]
+        sys.stdout.write(f"\r[{bar}] {alive_count}/{total} booted ({pct:.0%})  "
+                         f"{s} {int(elapsed)}s   ")
         sys.stdout.flush()
 
     def report_pending(header, pending):
         print(header)
         for name in sorted(pending):
             print(f"   - {name}  (device {targets[name]})")
-        print("\n➡️  Continuing to the configuration phase for the devices that "
-              "are up; serial login will keep retrying the rest.")
+        print("\n➡️  Continuing to the configuration phase; the serial login "
+              "waits for boot and retries on its own.")
 
     try:
         while True:
-            ping_map = get_vmm_ping_map()
-            alive = {name for name in targets if ping_map.get(name, "").lower() == "alive"}
-            draw(len(alive))
+            now = time.time()
+            # Poll 'vmm ping' every poll_interval, but redraw the bar every
+            # second so a slow boot shows a live ticking clock, not a frozen bar.
+            if last_poll == 0.0 or now - last_poll >= poll_interval:
+                ping_map = get_vmm_ping_map()
+                alive = {n for n in targets if ping_map.get(n, "").lower() == "alive"}
+                last_poll = now
+                if len(alive) != last_alive_count:
+                    last_alive_count = len(alive)
+                    last_change = now
+
+            draw(len(alive), now - start_time)
 
             if len(alive) == total:
                 print("\n\n✅ All devices booted and reachable!")
                 return
 
-            if len(alive) != last_alive_count:
-                last_alive_count = len(alive)
-                last_progress_time = time.time()
-
             pending = set(targets) - alive
-            if alive and (time.time() - last_progress_time) > stall_timeout:
-                report_pending(
-                    f"\n\n⏳ No further progress for {stall_timeout}s "
-                    f"({len(alive)}/{total} reachable). Still waiting on:", pending)
+            # Stall: nothing has changed for a while. Use a longer grace before
+            # ANY device answers (they may still be booting) and a shorter one
+            # once some are up (the rest may never get a mgmt address).
+            grace = stall_timeout if alive else no_response_timeout
+            if now - last_change > grace:
+                if alive:
+                    report_pending(f"\n\n⏳ No further progress for {stall_timeout}s "
+                                   f"({len(alive)}/{total} reachable). Still waiting on:", pending)
+                else:
+                    report_pending(f"\n\n⏳ No device answered ping in {no_response_timeout}s.", pending)
                 return
 
-            if time.time() - start_time > timeout:
-                report_pending(
-                    f"\n\n⏰ Timeout reached ({timeout}s). Not reachable:", pending)
+            if now - start_time > timeout:
+                report_pending(f"\n\n⏰ Timeout reached ({timeout}s). Not reachable:", pending)
                 return
 
-            time.sleep(poll_interval)
+            time.sleep(1)
 
     except KeyboardInterrupt:
-        print("\n\n\U0001f6d1 Monitoring stopped by user.", file=sys.stderr)
-        sys.exit(1)
+        print("\n\n⏭️  Skipping the boot wait; going straight to configuration.")
 
 
 # -----------------------------
@@ -745,15 +1230,15 @@ def _junos_serial_login(child, name, spawn_fn, debug=False,
     # --- Phase A: log in, reach a shell or CLI prompt ---
     while time.time() < deadline:
         idx = child.expect([
-            "login:",            # 0
-            "Password:",         # 1
-            "Login incorrect",   # 2
-            r"%",                # 3  FreeBSD shell
-            r"root@[^\r\n]*# ",  # 4  Linux root shell
-            r">\s",              # 5  Junos operational mode
-            r"#\s",              # 6  already in configuration mode
-            pexpect.TIMEOUT,     # 7
-            pexpect.EOF,         # 8
+            "login:",              # 0
+            "Password:",           # 1
+            "Login incorrect",     # 2
+            PROMPT_SHELL_PCT,      # 3  FreeBSD shell
+            PROMPT_SHELL_ROOT,     # 4  Linux root shell
+            PROMPT_OPER,           # 5  Junos operational mode
+            PROMPT_SHELL_BARE,     # 6  bare '# ' host/Linux shell (needs 'cli')
+            pexpect.TIMEOUT,       # 7
+            pexpect.EOF,           # 8
         ], timeout=nudge_interval)
         dbg(f"phaseA idx={idx}")
 
@@ -782,15 +1267,19 @@ def _junos_serial_login(child, name, spawn_fn, debug=False,
                         f"(check that the root password matches VMM_DEVICE_PASSWORD)")
 
     # --- Phase B: shell/CLI -> configuration mode ---
-    if state in (3, 4):          # FreeBSD % or Linux root shell -> enter cli
+    # A Junos config prompt is ALWAYS 'root@host#'; a bare '# ' (state 6) is a
+    # host/Linux shell, not config mode (e.g. the vBugatti/MX304 RE drops you
+    # at a bare '#' and you type 'cli' to enter Junos). So a bare '#' is
+    # treated like the other shells - run 'cli' - rather than assumed to be
+    # config mode, which used to make us fire 'set ...' commands at the shell.
+    if state in (3, 4, 6):       # FreeBSD %, Linux root shell, or bare '#' -> cli
         child.sendline("cli")
-        child.expect(r">\s", timeout=cli_timeout)
+        child.expect(PROMPT_OPER, timeout=cli_timeout)
         child.sendline("edit")
-        child.expect(r"#\s", timeout=cli_timeout)
+        child.expect(PROMPT_CONFIG, timeout=cli_timeout)
     elif state == 5:             # Junos operational '>' -> edit
         child.sendline("edit")
-        child.expect(r"#\s", timeout=cli_timeout)
-    # state == 6: already at '# '
+        child.expect(PROMPT_CONFIG, timeout=cli_timeout)
     dbg("reached configuration mode")
     return child
 
@@ -805,17 +1294,19 @@ def _set_root_password(child, password=None):
     child.sendline(password)
     child.expect(["Retype new password:", "Re-enter password:"])
     child.sendline(password)
-    child.expect(r"# ")
+    child.expect(PROMPT_CONFIG)
 
 # -----------------------------
 # Configure a vrouter/vswitch
 # -----------------------------
-def configure_vjunos_serial(name, interfaces, debug=False, retries=15, delay=10):
+def configure_vjunos_serial(name, interfaces, debug=False, retries=15, delay=10, re_name=None):
     """
-    Applies a baseline configuration to a single device via serial (vmm serial).
+    Applies the vJunosRouter/vJunosSwitch baseline to a single device via
+    serial. `re_name` overrides the console name (default '{name}'); vBugatti
+    reuses this exact baseline but its RE console is '{name}_RE'.
     """
 
-    cmd = f"vmm serial -t {name}"
+    cmd = f"vmm serial -t {re_name or name}"
 
     def spawn():
         return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
@@ -825,7 +1316,7 @@ def configure_vjunos_serial(name, interfaces, debug=False, retries=15, delay=10)
         child = _junos_serial_login(child, name, spawn, debug=debug)
 
         # --- Helper to send commands ---
-        def send_and_expect(cmd, prompt=r"# ", timeout=60):
+        def send_and_expect(cmd, prompt=PROMPT_CONFIG, timeout=60):
             child.sendline(cmd)
             child.expect(prompt, timeout=timeout)
             if debug:
@@ -864,77 +1355,7 @@ def configure_vjunos_serial(name, interfaces, debug=False, retries=15, delay=10)
             send_and_expect(c)
 
         # --- Commit & exit ---
-        send_and_expect("commit and-quit", prompt=r"> ", timeout=120)
-        child.sendline("exit")
-        child.close(force=True)
-
-        return f"✅ Successfully configured {name}"
-
-    except pexpect.exceptions.TIMEOUT:
-        return f"Failure: {name} (Timeout)"
-    except pexpect.exceptions.EOF:
-        return f"Failure: {name} (Connection Closed)"
-    except Exception as e:
-        print(f"❌ Failed to configure device {name} via serial. Error: {e}", file=sys.stderr)
-        return f"Failure: {name} ({e})"
-
-
-
-# -----------------------------
-# Configure a vtpx 
-# -----------------------------
-
-def configure_vptx_serial(name, interfaces, debug=False, retries=15, delay=10):
-    """
-    Applies a baseline configuration to a single device via serial (vmm serial).
-    """
-
-    cmd = f"vmm serial -t {name}_RE"
-
-    def spawn():
-        return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
-
-    try:
-        child = spawn()
-        child = _junos_serial_login(child, name, spawn, debug=debug)
-
-        # --- Helper to send commands ---
-        def send_and_expect(cmd, prompt=r"# ", timeout=60):
-            child.sendline(cmd)
-            child.expect(prompt, timeout=timeout)
-            if debug:
-                print(f"[{name}] executed: {cmd}, matched: {child.after.strip()!r}")
-
-        # --- Configure system ---
-        send_and_expect(f"set system host-name {name}")
-
-        # Root password
-        _set_root_password(child)
-
-        # --- Configure interfaces descriptions ---
-        for iface in interfaces:
-            send_and_expect(f'set interfaces {iface["name"]} description "{iface["description"]}"')
-
-        # --- Baseline commands ---
-        commands = [
-            "delete groups",
-            "delete apply-groups",
-            "set system services ssh root-login allow",
-            "set system services ssh sftp-server",
-            "set system services netconf ssh",
-            "set system management-instance",
-            "set protocols lldp interface all",
-            "set protocols lldp interface em0 disable",
-            "set chassis aggregated-devices ethernet device-count 10",
-            "delete groups member0",
-            "set interfaces em0.0 family inet dhcp",
-            "delete groups member0",
-        ]
-        for c in commands:
-            send_and_expect(c)
-
-        # --- Commit & exit ---
-        send_and_expect("commit and-quit", prompt=r"> ", timeout=120)
+        send_and_expect("commit and-quit", prompt=PROMPT_OPER, timeout=120)
         child.sendline("exit")
         child.close(force=True)
 
@@ -1066,18 +1487,24 @@ def _vmx_baseline(mgmt_iface="fxp0", include_fpc3_picmode=False):
 # vmx and vFerrari manage on fxp0; vAlfaRomeo manages on em0.
 VMX_BASELINE_LINES = _vmx_baseline("fxp0", include_fpc3_picmode=True)
 VALFAROMEO_BASELINE_LINES = _vmx_baseline("em0", include_fpc3_picmode=False)
+# vHamilton (vMX10004) is an MX-family RE with em0 management and a single
+# FPC0, so it takes the same baseline shape as vAlfaRomeo.
+VHAMILTON_BASELINE_LINES = _vmx_baseline("em0", include_fpc3_picmode=False)
 VFERRARI_BASELINE_LINES = _vmx_baseline("fxp0", include_fpc3_picmode=False) + [
     # vFerrari-specific: required forwarding mode for this profile.
     "set forwarding-options hyper-mode",
 ]
+# NOTE: vBugatti (MX304) is NOT configured with a vmx-family baseline - it
+# reuses the vJunosRouter init (configure_vjunos_serial), applied on its
+# '{host}_RE' console. See the Phase 4 dispatch in main().
 
 
-def configure_vmx_serial(name, interfaces, baseline=None, debug=False, retries=15, delay=10):
+def configure_vmx_serial(name, interfaces, baseline=None, debug=False,
+                         retries=15, delay=10, re_name=None):
     """
     Configure a vmx-family device (vmx, vFerrari, vAlfaRomeo) over its serial
-    console. All three expose their RE as '{hostname}_RE' and take the same
-    baseline; `baseline` selects the variant (vAlfaRomeo manages on em0 rather
-    than fxp0, so it passes VALFAROMEO_BASELINE_LINES).
+    console. `baseline` selects the variant; `re_name` overrides the RE console
+    name (default '{hostname}_RE').
 
     The vmx boots with only the lab's inherited groups (no vmx-default.cfg is
     installed any more), so this applies the complete baseline in one commit:
@@ -1098,8 +1525,10 @@ def configure_vmx_serial(name, interfaces, baseline=None, debug=False, retries=1
     """
     if baseline is None:
         baseline = VMX_BASELINE_LINES
+    if re_name is None:
+        re_name = f"{name}_RE"
 
-    cmd = f"vmm serial -t {name}_RE"
+    cmd = f"vmm serial -t {re_name}"
 
     def spawn():
         return _spawn_serial_with_retry(cmd, name, debug=debug, retries=retries, delay=delay)
@@ -1116,7 +1545,7 @@ def configure_vmx_serial(name, interfaces, baseline=None, debug=False, retries=1
         child = _junos_serial_login(child, name, spawn, debug=debug, cli_timeout=600)
 
         # --- Helper to send commands ---
-        def send_and_expect(cmd, prompt=r"# ", timeout=60):
+        def send_and_expect(cmd, prompt=PROMPT_CONFIG, timeout=60):
             nonlocal last_command
             last_command = cmd
             child.sendline(cmd)
@@ -1150,7 +1579,7 @@ def configure_vmx_serial(name, interfaces, baseline=None, debug=False, retries=1
             )
 
         # --- Commit & detach ---
-        send_and_expect("commit and-quit", prompt=r"> ", timeout=300)
+        send_and_expect("commit and-quit", prompt=PROMPT_OPER, timeout=300)
         child.sendline("exit")
         child.close(force=True)
 
@@ -1182,7 +1611,7 @@ def configure_vscapa_serial(name, interfaces, debug=False, retries=15, delay=10)
         child = _junos_serial_login(child, name, spawn, debug=debug)
 
         # --- Helper to send commands ---
-        def send_and_expect(cmd, prompt=r"# ", timeout=60):
+        def send_and_expect(cmd, prompt=PROMPT_CONFIG, timeout=60):
             child.sendline(cmd)
             child.expect(prompt, timeout=timeout)
             if debug:
@@ -1229,7 +1658,7 @@ def configure_vscapa_serial(name, interfaces, debug=False, retries=15, delay=10)
         for attempt in range(1, max_gw_attempts + 1):
             time.sleep(5)
             child.sendline('run show dhcp client binding detail | match "Name: routers, Value: "')
-            child.expect(r"# ", timeout=30)
+            child.expect(PROMPT_CONFIG, timeout=30)
             output = child.before
             if debug:
                 print(f"[{name}] DHCP binding output (attempt {attempt}):\n{output}")
@@ -1286,7 +1715,7 @@ def configure_vbrackla_serial(name, interfaces, debug=False, retries=15, delay=1
         child = _junos_serial_login(child, name, spawn, debug=debug)
 
         # --- Helper to send commands ---
-        def send_and_expect(cmd, prompt=r"# ", timeout=60):
+        def send_and_expect(cmd, prompt=PROMPT_CONFIG, timeout=60):
             child.sendline(cmd)
             child.expect(prompt, timeout=timeout)
             if debug:
@@ -1332,7 +1761,7 @@ def configure_vbrackla_serial(name, interfaces, debug=False, retries=15, delay=1
         for attempt in range(1, max_gw_attempts + 1):
             time.sleep(5)
             child.sendline('run show dhcp client binding detail | match "Name: routers, Value: "')
-            child.expect(r"# ", timeout=30)
+            child.expect(PROMPT_CONFIG, timeout=30)
             output = child.before
             if debug:
                 print(f"[{name}] DHCP binding output (attempt {attempt}):\n{output}")
@@ -1501,13 +1930,14 @@ def print_summary_table(topology_data):
             image_display = image_path
         
         # The mgmt IP is reported against the RE component, whose name is
-        # type-specific: '{name}_RE' for vmx/vptx, '{name}_RE0' for vscapa,
-        # and '{name}-vBrackla_RE0' for vbrackla (see PTX_CHAS_NAME in the
-        # template). Everything else is keyed on the plain hostname.
+        # type-specific: '{name}_RE' for the vmx family, '{name}-re0' for the
+        # vmm3 MX cosim (vbugatti/valfaromeo), '{name}_RE0' for the vmm3 EVO PTX
+        # vmm3 EVO PTX types (including vbrackla). Everything else is keyed on
+        # the plain hostname. Mirrors re_ping_name().
         lookup_name = (
-        f"{name}_RE" if vm_type in ["vmx", "vptx", "vferrari", "valfaromeo"]
-        else f"{name}_RE0" if vm_type == "vscapa"
-        else f"{name}-vBrackla_RE0" if vm_type == "vbrackla"
+        f"{name}_RE" if vm_type in ["vmx", "vferrari", "vhamilton", "vmaserati"]
+        else f"{name}-re0" if vm_type in ["vbugatti", "valfaromeo"]
+        else f"{name}_RE0" if vm_type in ["vscapa", "vbalerion", "vardbeg", "vbowmore", "vbrackla"]
         else name)
         status = ping_data.get(lookup_name, {})
         state = status.get('state', 'unknown')
@@ -1676,8 +2106,9 @@ def handle_config_management(topology_file):
 # 'server'/'sniffer'). Used both to decide who to wait for in Phase 3 and who
 # to configure in Phase 4.
 CONFIGURABLE_TYPES = (
-    'vrouter', 'vswitch', 'vptx', 'vmx', 'vferrari', 'valfaromeo',
-    'vscapa', 'vbrackla', 'vqfx',
+    'vrouter', 'vswitch', 'vmx', 'vferrari', 'valfaromeo',
+    'vbugatti', 'vhamilton', 'vmaserati', 'vscapa', 'vbrackla', 'vqfx',
+    'vbalerion', 'vardbeg', 'vbowmore',
 )
 
 
@@ -1694,10 +2125,13 @@ def configurable_devices(topology_data):
 # Per-device boot gate (vmm ping)
 # -----------------------------
 def get_vmm_ping_map():
-    """Run 'vmm ping' and return {node_name: state} (e.g. {'PE1_RE': 'alive'})."""
+    """Run 'vmm ping' and return {node_name: state} (e.g. {'PE1_RE': 'alive'}).
+    Always returns quickly - a 'vmm ping' that hangs (common while devices are
+    still booting) is bounded by a timeout so it can't freeze the caller."""
     try:
-        result = subprocess.run(["vmm", "ping"], capture_output=True, text=True, check=False)
-    except FileNotFoundError:
+        result = subprocess.run(["vmm", "ping"], capture_output=True, text=True,
+                                 check=False, timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
         return {}
     ping_map = {}
     for line in result.stdout.strip().splitlines():
@@ -1707,40 +2141,876 @@ def get_vmm_ping_map():
     return ping_map
 
 
+def get_vmm_ip_map():
+    """Run 'vmm ping' and return {node_name: ipv4}. Empty if 'vmm' is absent
+    (e.g. generating a diagram off-pod before deployment) or the call times out."""
+    try:
+        result = subprocess.run(["vmm", "ping"], capture_output=True, text=True,
+                                 check=False, timeout=20)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+    ip_re = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+    ip_map = {}
+    for line in result.stdout.strip().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and ip_re.match(parts[1]):
+            ip_map[parts[0]] = parts[1]
+    return ip_map
+
+
+def get_lo0_address(ip):
+    """
+    SSH/NETCONF into a Junos device and return its lo0.0 primary inet address
+    (the loopback), or '' if lo0.0 has no user address yet, the device is
+    unreachable, or credentials don't match. Best-effort and fast-failing
+    (auto_probe) so it never blocks diagram generation for long.
+    """
+    if not ip:
+        return ''
+    dev = None
+    try:
+        dev = Device(host=ip, user=DEVICE_ROOT_USER, passwd=DEVICE_ROOT_PASSWORD,
+                     timeout=10, auto_probe=5)
+        dev.open()
+        rsp = dev.rpc.get_interface_information(interface_name='lo0.0', terse=True)
+        for af in rsp.findall('.//address-family'):
+            if (af.findtext('address-family-name') or '').strip() != 'inet':
+                continue
+            for ifa in af.findall('interface-address/ifa-local'):
+                a = (ifa.text or '').strip().split('/')[0]
+                # skip Junos-internal loopback addresses (127.x, 128.0.0.x)
+                if a and not a.startswith('127.') and not a.startswith('128.0.0.'):
+                    return a
+        return ''
+    except Exception:
+        return ''
+    finally:
+        if dev is not None:
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+
+def annotate_lo0(nodes):
+    """Fill each Junos node's 'lo0' from the live device (parallel, best effort)."""
+    junos = [n for n in nodes if n.get('ip') and n['type'] in CONFIGURABLE_TYPES]
+    results = {}
+    if junos:
+        with ThreadPoolExecutor(max_workers=min(8, len(junos))) as ex:
+            futs = {ex.submit(get_lo0_address, n['ip']): n['id'] for n in junos}
+            for f in as_completed(futs):
+                try:
+                    results[futs[f]] = f.result()
+                except Exception:
+                    results[futs[f]] = ''
+    for n in nodes:
+        n['lo0'] = results.get(n['id'], '')
+
+
 def re_ping_name(host, vtype):
     """The name a device's RE appears under in 'vmm ping' (see the RE naming in
     lab_template.j2 and print_summary_table)."""
-    if vtype in ('vmx', 'vptx', 'vferrari', 'valfaromeo'):
+    if vtype in ('vmx', 'vferrari', 'vhamilton', 'vmaserati'):
         return f"{host}_RE"
-    if vtype == 'vscapa':
+    if vtype in ('vbugatti', 'valfaromeo'):
+        # template: VMX304_RE_START(<hostname>-re0, 0) /
+        #           VMX10008_RE_START(<hostname>-re0, 0)
+        return f"{host}-re0"
+    if vtype in ('vscapa', 'vbalerion', 'vardbeg', 'vbowmore', 'vbrackla'):
+        # vmm3 EVO REs appear as '<hostname>_RE0' (e.g. vbrackla_RE0).
         return f"{host}_RE0"
-    if vtype == 'vbrackla':
-        return f"{host}-vBrackla_RE0"
     return host
+
+
+# -----------------------------
+# Interface cheat sheet (--interfaces)
+# -----------------------------
+# Human-readable valid-interface summary per VM type. Mirrors the rules
+# enforced in validate_topology() so an engineer never has to remember which
+# prefix (et-/ge-/xe-) a given device uses.
+INTERFACE_HELP = {
+    'server':     "em1, em2, ...            (data ports; em0 is management)",
+    'sniffer':    "(none - spliced onto a link with 'sniffer: true')",
+    'vswitch':    "ge-0/0/0, ge-0/0/1, ...  (sequential from 0)",
+    'vrouter':    "ge-0/0/0, ge-0/0/1, ...  (sequential from 0)",
+    'vqfx':       "xe-0/0/0, xe-0/0/1, ...  (sequential from 0)",
+    'vmx':        "ge-0/0/0-9, ge-0/1/0-9, xe-0/2/0-1, xe-0/3/0-1, "
+                  "xe-1/0/0-5:0-3, xe-2/0/0-5:0-3, et-3/0/0-5, xe-5/0/0-11   (any subset)",
+    'vferrari':   "et-0/0/0 .. et-0/0/4      (any subset)",
+    'vbugatti':   "et-0/0/0 .. et-0/0/15     (any subset)",
+    'vhamilton':  "et-<0-2>/0/0 .. et-<0-2>/0/13  (any subset; et-1/... and et-2/... add FPC1/FPC2)",
+    'vmaserati':  "et-<0-2>/0/0 .. et-<0-2>/0/19 and et-<0-2>/1/0 .. et-<0-2>/1/15  (2 pics, 36 ports; et-1/... and et-2/... add FPC1/FPC2)",
+    'valfaromeo': "et-<0-2>/0/<0-3>:<0-3>    (any subset; et-1/... and et-2/... ports add a 2nd/3rd linecard)",
+    'vscapa':     "et-0/0/1,3,5,7,9,11,13,15  (ODD ports only; vmm3 EVO PTX)",
+    'vbrackla':   "et-1/0/0 .. et-1/0/4     (any subset; vmm3 EVO PTX, FPC1)",
+    'vbalerion':  "et-0/0/9 .. et-0/0/26     (any subset; vmm3 EVO PTX)",
+    'vardbeg':    "et-0/0/0 .. et-0/0/11     (any subset; vmm3 EVO PTX)",
+    'vbowmore':   "et-0/0/1,3,5,7,9,11,13,15  (ODD ports only; vmm3 EVO PTX)",
+}
+
+
+def _load_topology(topology_file):
+    """Load and return the raw topology dict, exiting cleanly on error."""
+    try:
+        with open(topology_file) as f:
+            return yaml.safe_load(f)
+    except FileNotFoundError:
+        print(f"❌ Error: Topology file not found at '{topology_file}'", file=sys.stderr)
+        sys.exit(1)
+    except yaml.YAMLError as e:
+        print(f"❌ Error: Could not parse YAML file '{topology_file}'. Error: {e}", file=sys.stderr)
+        sys.exit(1)
+
+
+def print_interfaces(topology_file):
+    """Print the valid interfaces for every device in the topology."""
+    data = _load_topology(topology_file)
+    vms = data.get('vms', [])
+    print(f"\nInterfaces for lab '{data.get('lab_name', '?')}' ({topology_file}):\n")
+    width = max((len(vm.get('hostname', '')) for vm in vms), default=4)
+    for vm in vms:
+        host = vm.get('hostname', '?')
+        vtype = vm.get('type', '?')
+        # 'sniffer' is a server on sniffer_disk; label it as such.
+        if vtype == 'server' and vm.get('disk') == 'sniffer_disk':
+            vtype = 'sniffer'
+        help_text = INTERFACE_HELP.get(vtype, "(unknown type)")
+        print(f"  {host:<{width}}  {vtype:<11} {help_text}")
+    print("\nWrite links as 'hostname:interface', e.g. "
+          f"[\"{vms[0]['hostname']}:...\", \"...\"]" if vms else "")
+
+
+def print_devices(topology_file):
+    """Print every Junos device as a junos-mcp-server style devices.json map:
+
+        {
+          "<hostname>": {
+            "ip": "<mgmt ip>",
+            "port": 22,
+            "username": "root",
+            "auth": {"type": "password", "password": "..."}
+          },
+          ...
+        }
+
+    IPs are the live management addresses from 'vmm ping' (empty if the device
+    is not up yet). Only Junos devices are emitted - Linux server/sniffer VMs
+    are not managed over SSH with these credentials. The JSON is written to
+    stdout so it can be redirected straight into a file:
+
+        python3 vmm.py -t topo.yml --print_devices > devices.json
+    """
+    import json
+    data = _load_topology(topology_file)
+    ip_map = get_vmm_ip_map()
+    devices = {}
+    for vm in data.get('vms', []):
+        vtype = vm.get('type')
+        if vtype not in CONFIGURABLE_TYPES:
+            continue  # server / sniffer are Linux hosts, not Junos over SSH
+        host = vm['hostname']
+        devices[host] = {
+            "ip": ip_map.get(re_ping_name(host, vtype), ""),
+            "port": 22,
+            "username": DEVICE_ROOT_USER,
+            "auth": {
+                "type": "password",
+                "password": DEVICE_ROOT_PASSWORD,
+            },
+        }
+    print(json.dumps(devices, indent=2))
+
+
+# -----------------------------
+# Interactive topology diagram (--diagram)
+# -----------------------------
+def _build_topology_html(topology_file):
+    """Build the interactive diagram HTML from the topology, embedding current
+    mgmt IPs (best effort from 'vmm ping'). Returns (html, n_nodes, n_edges,
+    n_with_ip)."""
+    import json
+    data = _load_topology(topology_file)
+
+    vms = data.get('vms', [])
+    def _vtype(vm):
+        t = vm.get('type', '?')
+        return 'sniffer' if (t == 'server' and vm.get('disk') == 'sniffer_disk') else t
+    known = {vm['hostname'] for vm in vms}
+
+    ip_map = get_vmm_ip_map()
+    nodes = []
+    for vm in vms:
+        host = vm['hostname']
+        ip = ip_map.get(re_ping_name(host, vm.get('type')), '')
+        nodes.append({'id': host, 'type': _vtype(vm), 'ip': ip})
+
+    # Best-effort: pull each reachable Junos device's lo0.0 loopback address
+    # over SSH so it can be shown above the icon (blank if not configured).
+    annotate_lo0(nodes)
+
+    edges = []
+    for link in data.get('links', []):
+        eps = link.get('endpoints', [])
+        if len(eps) != 2:
+            continue
+        try:
+            a, ai = eps[0].split(':', 1)
+            b, bi = eps[1].split(':', 1)
+        except ValueError:
+            continue
+        if a in known and b in known:
+            edges.append({'a': a, 'ai': ai, 'b': b, 'bi': bi,
+                          'sniffer': bool(link.get('sniffer'))})
+
+    html = (_TOPOLOGY_HTML
+            .replace("__LAB__", json.dumps(data.get('lab_name', 'lab')))
+            .replace("__NODES__", json.dumps(nodes))
+            .replace("__EDGES__", json.dumps(edges)))
+    return (html, len(nodes), len(edges),
+            sum(1 for n in nodes if n['ip']),
+            sum(1 for n in nodes if n.get('lo0')))
+
+
+def generate_topology_diagram(topology_file, out_path):
+    """
+    Render a self-contained, interactive HTML diagram of the topology (one
+    draggable box per device, every link labelled with the interface at both
+    ends, mgmt IPs shown, add text/zone annotations, export PNG/SVG). No
+    internet/CDN needed. Layout + annotations persist in the browser per lab.
+    """
+    html, nn, ne, hi, lo = _build_topology_html(topology_file)
+    with open(out_path, "w") as f:
+        f.write(html)
+    ip_note = f", {hi} with mgmt IPs" if hi else " (no IPs yet - run after deploy to show them)"
+    lo_note = f", {lo} with lo0 loopbacks" if lo else ""
+    print(f"✅ Topology diagram written to '{out_path}' "
+          f"({nn} devices, {ne} links{ip_note}{lo_note}). Open it in a browser: "
+          f"drag devices, add text/zones, export PNG/SVG.")
+
+
+def qpod_ip():
+    """Best-effort primary IPv4 of this QPOD (the address a browser would use
+    to reach it)."""
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))   # no packets sent; just resolves the route's source IP
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"
+
+
+def scan_live(topology_file):
+    """Return {hostname: {'ip': .., 'lo0': ..}} scanned live from the running
+    lab ('vmm ping' for mgmt IPs, SSH for lo0). Used by the server's periodic
+    refresh so loopbacks configured/changed after boot show up in the browser."""
+    data = _load_topology(topology_file)
+    ip_map = get_vmm_ip_map()
+    nodes = []
+    for vm in data.get('vms', []):
+        t = vm.get('type')
+        host = vm['hostname']
+        vt = 'sniffer' if (t == 'server' and vm.get('disk') == 'sniffer_disk') else t
+        nodes.append({'id': host, 'type': vt,
+                      'ip': ip_map.get(re_ping_name(host, t), '')})
+    annotate_lo0(nodes)
+    return {n['id']: {'ip': n['ip'], 'lo0': n.get('lo0', '')} for n in nodes}
+
+
+def serve_topology_diagram(topology_file, port=8080, out_path="topology.html",
+                           scan_interval=10):
+    """
+    Host the interactive topology diagram over HTTP on this QPOD at
+    http://<qpod-ip>:<port>/ . A background thread rescans the running lab
+    every `scan_interval`s (mgmt IPs + lo0 loopbacks); the page polls GET /data
+    and updates the labels live, so loopbacks configured/changed after the lab
+    is up appear without regenerating. Blocks until Ctrl+C / SIGTERM.
+    """
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    html, nn, ne, hi, lo = _build_topology_html(topology_file)
+    try:
+        with open(out_path, "w") as f:
+            f.write(html)
+    except OSError:
+        pass
+    payload = html.encode("utf-8")
+
+    lock = threading.Lock()
+    live = {"state": {}}
+
+    def scanner():
+        while True:
+            try:
+                s = scan_live(topology_file)
+                with lock:
+                    live["state"] = s
+            except Exception:
+                pass
+            time.sleep(scan_interval)
+
+    threading.Thread(target=scanner, daemon=True).start()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path.startswith("/data"):
+                with lock:
+                    body = json.dumps(live["state"]).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+        def log_message(self, *a):
+            pass
+
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as e:
+        print(f"❌ Could not start the web server on port {port}: {e}\n"
+              f"   Try a different port with --port <N>.", file=sys.stderr)
+        return
+
+    ip = qpod_ip()
+    ipnote = f"{hi}/{nn} devices show a mgmt IP" if hi else "no mgmt IPs yet (deploy first to show them)"
+    lonote = f", {lo} with lo0 loopbacks" if lo else ""
+    print("\n" + "=" * 60)
+    print("  🌐  Topology is live — open it in a browser:")
+    print(f"          http://{ip}:{port}/")
+    print("=" * 60)
+    print(f"  {nn} devices, {ne} links, {ipnote}{lonote}.")
+    print(f"  Live: mgmt IPs + lo0 loopbacks refresh every {scan_interval}s.")
+    print("  Editable: drag devices, add text/zones, export PNG/SVG.")
+    print("  Press Ctrl+C to stop serving.\n")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n🛑 Stopped serving the topology.")
+    finally:
+        srv.server_close()
+
+
+# PID file for the detached background web server (kept in the cwd so it lives
+# next to the topology/lab files it serves).
+_SERVER_PIDFILE = "topology_server.pid"
+_SERVER_LOGFILE = "topology_server.log"
+
+
+def _port_answers(port, host="127.0.0.1", timeout=0.4):
+    """True if something is accepting TCP connections on this port."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_pid_exit(pid, timeout=5.0):
+    """Block until `pid` is gone (or timeout). Returns True if it exited."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.1)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return True
+    return False
+
+
+def start_topology_server_bg(topology_file, port=8080):
+    """
+    Launch the topology web server as an independent, detached background
+    process (a fresh 'python3 vmm.py ... --serve') so it runs in parallel and
+    keeps serving after this command returns. Records its PID for --serve-stop.
+
+    The success banner is only printed once the new process has actually bound
+    the port. Previously it was printed unconditionally: if a stale server still
+    held the port, the child died with 'Address already in use' into the log file
+    while the console reported success - so you would browse the PREVIOUS lab's
+    diagram and see a topology that no longer matched the YAML.
+    """
+    # If one is already running, stop it first and wait for the port to be
+    # released - SIGTERM is asynchronous, so spawning immediately races it.
+    if os.path.exists(_SERVER_PIDFILE):
+        stop_topology_server(quiet=True)
+
+    if _port_answers(port):
+        # Something else still holds the port (pid file lost, or a server was
+        # started from a different directory - the pid file lives in the cwd).
+        holder = ""
+        try:
+            out = subprocess.run(["lsof", "-ti", f"tcp:{port}"],
+                                 capture_output=True, text=True, timeout=5).stdout.split()
+            if out:
+                holder = f" (held by pid {', '.join(out)})"
+        except Exception:
+            pass
+        print(f"\n❌ Port {port} is already in use{holder}.", file=sys.stderr)
+        print("   That is almost certainly an older topology server still running -\n"
+              "   if it is left alone you would be shown the PREVIOUS lab's diagram.\n"
+              f"   Stop it with:  python3 {os.path.basename(__file__)} --serve-stop\n"
+              f"   ...or serve this lab elsewhere with:  --serve --port {port + 1}",
+              file=sys.stderr)
+        return
+
+    cmd = [sys.executable, os.path.abspath(__file__),
+           "-t", topology_file, "--serve-fg", "--port", str(port)]
+    try:
+        logf = open(_SERVER_LOGFILE, "ab")
+        proc = subprocess.Popen(
+            cmd, stdout=logf, stderr=logf, stdin=subprocess.DEVNULL,
+            start_new_session=True,   # detach from this terminal/process group
+        )
+    except Exception as e:
+        print(f"❌ Could not start the background web server: {e}", file=sys.stderr)
+        return
+
+    # Confirm it really came up before claiming success.
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        if _port_answers(port):
+            break
+        if proc.poll() is not None:      # child exited early
+            break
+        time.sleep(0.2)
+
+    if not _port_answers(port):
+        print(f"\n❌ The topology web server did not come up on port {port}.", file=sys.stderr)
+        try:
+            with open(_SERVER_LOGFILE) as f:
+                tail = f.read().strip().splitlines()[-12:]
+            if tail:
+                print("   Last lines of " + _SERVER_LOGFILE + ":", file=sys.stderr)
+                for line in tail:
+                    print("     " + line, file=sys.stderr)
+        except OSError:
+            pass
+        return
+
+    with open(_SERVER_PIDFILE, "w") as f:
+        f.write(str(proc.pid))
+
+    ip = qpod_ip()
+    print("\n" + "=" * 60)
+    print("  🌐  Topology web server running in the background:")
+    print(f"          http://{ip}:{port}/")
+    print("=" * 60)
+    print(f"  pid {proc.pid}  ·  logs: {_SERVER_LOGFILE}")
+    print(f"  Serving: {topology_file}")
+    print("  If the diagram looks stale, hard-refresh the browser (Ctrl-Shift-R).")
+    print(f"  Stop it with:  python3 {os.path.basename(__file__)} --serve-stop\n")
+
+
+def stop_topology_server(quiet=False):
+    """Stop the background web server started with --serve-bg (via its PID file)."""
+    if not os.path.exists(_SERVER_PIDFILE):
+        if not quiet:
+            print("No background topology web server is recorded (no pid file).")
+        return
+    try:
+        pid = int(open(_SERVER_PIDFILE).read().strip())
+        os.kill(pid, signal.SIGTERM)
+        # Wait for it to actually go away, otherwise a server started straight
+        # afterwards races it for the port and loses.
+        if not _wait_for_pid_exit(pid):
+            os.kill(pid, signal.SIGKILL)
+            _wait_for_pid_exit(pid, timeout=3.0)
+        if not quiet:
+            print(f"🛑 Stopped topology web server (pid {pid}).")
+    except (ProcessLookupError, ValueError):
+        if not quiet:
+            print("Topology web server was not running.")
+    except Exception as e:
+        if not quiet:
+            print(f"Could not stop topology web server: {e}", file=sys.stderr)
+    finally:
+        try:
+            os.remove(_SERVER_PIDFILE)
+        except OSError:
+            pass
+
+
+# The diagram is a single self-contained HTML page (SVG + vanilla JS, no CDN).
+# It is also a light editor: add text / zone annotations, show mgmt IPs, and
+# export to PNG/SVG. __LAB__ / __NODES__ / __EDGES__ are replaced with JSON at
+# generation time (each node carries an optional 'ip' from 'vmm ping').
+_TOPOLOGY_HTML = r"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8"><title>VMM topology</title>
+<style>
+  html,body{margin:0;height:100%;background:#0f1720;color:#e6edf3;font-family:Arial,Helvetica,sans-serif}
+  #bar{position:fixed;top:0;left:0;right:0;height:46px;display:flex;align-items:center;gap:7px;
+       padding:0 12px;background:#16212e;border-bottom:1px solid #24313f;z-index:10}
+  #bar b{font-size:14px;margin-right:4px}
+  #bar .hint{color:#8aa0b2;font-size:12px;margin:0 6px}
+  #bar button{background:#24313f;color:#e6edf3;border:1px solid #33475a;border-radius:6px;
+              padding:6px 10px;cursor:pointer;font-size:13px}
+  #bar button:hover{background:#2c3d4e}
+  #bar button.on{background:#2f6feb;border-color:#2f6feb;color:#fff}
+  .pal{display:inline-flex;gap:5px;margin:0 4px}
+  .sw{width:18px;height:18px;padding:0;border-radius:50%;border:1px solid #0007;cursor:pointer}
+  .grow{flex:1}
+  svg{position:fixed;inset:46px 0 0 0;width:100%;height:calc(100% - 46px);cursor:grab;touch-action:none}
+  .rsz{cursor:nwse-resize}
+</style></head>
+<body>
+<div id="bar">
+  <b id="lab"></b>
+  <button class="tool on" data-tool="select">Select</button>
+  <button class="tool" data-tool="text">+ Text</button>
+  <button class="tool" data-tool="zone">+ Zone</button>
+  <button id="szdn" title="smaller icons">Icon &minus;</button>
+  <button id="szup" title="bigger icons">Icon +</button>
+  <span id="palette" class="pal"></span>
+  <button id="del">Delete</button>
+  <span class="hint">drag a port dot to re-attach a link &middot; drag a label to move it (double-click to rename) &middot; grab a link to bend &middot; scroll = zoom</span>
+  <span class="grow"></span>
+  <button id="pngb">PNG</button>
+  <button id="svgb">SVG</button>
+  <button id="reset">Reset</button>
+</div>
+<svg id="svg">
+  <style>
+    .edge{stroke:#6b8296;stroke-width:1.8;fill:none}
+    .edge.sniff{stroke:#e0a33e;stroke-dasharray:7 4}
+    .iflabel{font-size:10.5px;fill:#e6edf3;paint-order:stroke;stroke:#0f1720;stroke-width:3px;
+             stroke-linejoin:round;text-anchor:middle}
+    text{font-family:Arial,Helvetica,sans-serif}
+    .nh{font-size:13px;font-weight:600;fill:#eaf1f8;text-anchor:middle;paint-order:stroke;stroke:#0f1720;stroke-width:2.6px;stroke-linejoin:round}
+    .nip{font-size:10.5px;fill:#9db4c8;text-anchor:middle;font-family:monospace;paint-order:stroke;stroke:#0f1720;stroke-width:2.6px;stroke-linejoin:round}
+    .nlo{font-size:11px;font-weight:600;fill:#8fe3c8;text-anchor:middle;font-family:monospace;paint-order:stroke;stroke:#0f1720;stroke-width:2.8px;stroke-linejoin:round}
+    .rsz{cursor:nwse-resize}
+    .port{fill:#cfe3f5;stroke:#0f1720;stroke-width:1;cursor:grab}
+  </style>
+  <defs><pattern id="grid" width="26" height="26" patternUnits="userSpaceOnUse">
+    <rect width="26" height="26" fill="#0f1720"/><circle cx="2" cy="2" r="1" fill="#1c2b3b"/>
+  </pattern></defs>
+  <g id="vp"><rect x="-4000" y="-4000" width="8000" height="8000" fill="url(#grid)"/><g id="zones"></g><g id="edges"></g><g id="labels"></g><g id="nodes"></g><g id="ports"></g><g id="texts"></g></g>
+</svg>
+<script>
+const LAB=__LAB__, NODES=__NODES__, EDGES=__EDGES__;
+const KEY='vmm_topo_'+LAB;
+document.getElementById('lab').textContent=LAB+" — topology";
+const COLORS={server:'#c9d1d9',sniffer:'#e0a33e',vswitch:'#6cb6ff',vrouter:'#6cb6ff',
+ vmx:'#7ee787',vferrari:'#7ee787',vbugatti:'#7ee787',vhamilton:'#7ee787',vmaserati:'#7ee787',
+ vscapa:'#f0883e',vardbeg:'#f0883e',vbowmore:'#f0883e',vbrackla:'#f0883e',valfaromeo:'#f0883e',vbalerion:'#f0883e',vqfx:'#d2a8ff'};
+function cat(t){if(t==='server')return'server';if(t==='sniffer')return'sniffer';if(t==='vswitch'||t==='vqfx')return'switch';return'router';}
+const ICON={
+ router:'<circle r="8" fill="none" stroke="#0c141c" stroke-width="1.3"/><g stroke="#0c141c" stroke-width="1.2" fill="none"><path d="M0 -6V-11 M-2.2 -8.6L0 -11L2.2 -8.6"/><path d="M0 6V11 M-2.2 8.6L0 11L2.2 8.6"/><path d="M-6 0H-11 M-8.6 -2.2L-11 0L-8.6 2.2"/><path d="M6 0H11 M8.6 -2.2L11 0L8.6 2.2"/></g>',
+ switch:'<rect x="-10" y="-7" width="20" height="14" rx="3" fill="none" stroke="#0c141c" stroke-width="1.3"/><g stroke="#0c141c" stroke-width="1.2" fill="none"><path d="M-6 -2H6 M3 -5L6 -2L3 1"/><path d="M6 3H-6 M-3 0L-6 3L-3 6"/></g>',
+ server:'<rect x="-7" y="-10" width="14" height="20" rx="2" fill="none" stroke="#0c141c" stroke-width="1.3"/><g stroke="#0c141c" stroke-width="1.2"><path d="M-4 -6H4"/><path d="M-4 -1H4"/><path d="M-4 4H2"/></g>',
+ sniffer:'<circle cx="-2" cy="-2" r="6" fill="none" stroke="#0c141c" stroke-width="1.3"/><path d="M2.5 2.5L8 8" stroke="#0c141c" stroke-width="1.8" fill="none"/>'
+};
+const PALETTE=['#ffd24a','#ff6b6b','#4ade80','#5ac8fa','#e6edf3'];
+const NS='http://www.w3.org/2000/svg';
+const svg=document.getElementById('svg'),vp=document.getElementById('vp');
+const gZ=document.getElementById('zones'),gE=document.getElementById('edges'),gL=document.getElementById('labels'),gN=document.getElementById('nodes'),gP=document.getElementById('ports'),gT=document.getElementById('texts');
+let HAS_IP=NODES.some(n=>n.ip);
+// Fan parallel links between the same pair of devices: index each edge within
+// its pair so update() can bow them apart into separate curves.
+const _pk=e=>[e.a,e.b].slice().sort().join('|');
+const _tot={};EDGES.forEach(e=>{_tot[_pk(e)]=(_tot[_pk(e)]||0)+1;});
+const _seen={};EDGES.forEach(e=>{const k=_pk(e);e._i=(k in _seen)?_seen[k]+1:0;_seen[k]=e._i;e._n=_tot[k];});
+EDGES.forEach(e=>{e._ai=e.ai;e._bi=e.bi;});   // keep originals for Reset
+let view={x:60,y:60,k:1},pos={},annos=[],tool='select',sel=null,curColor=PALETTE[0],uid=1,active=null,nodeScale=1;
+// Parallel links leave the icon at slightly different angles so their dots and
+// labels don't stack. FAN is the angle between adjacent links; FAN_MAX caps the
+// total spread so a device with many parallel links keeps them on one face.
+const FAN=0.40, FAN_MAX=1.2;
+
+function el(t,a){const e=document.createElementNS(NS,t);for(const k in a)e.setAttribute(k,a[k]);return e;}
+function txt(x,y,s,a){const e=el('text',Object.assign({x:x,y:y},a||{}));e.textContent=s;return e;}
+// Saved browser state is keyed by lab name, so editing a topology (or reusing a
+// lab_name for a different one) must not resurrect the previous lab's data.
+// Every saved item is therefore matched by IDENTITY, never by array index:
+//   - node positions by hostname (unknown hostnames are dropped)
+//   - edge state by endpoint+original-interface signature
+// Restoring edges by index was the old behaviour and it silently pasted the
+// previous topology's interface labels onto the new links.
+const _eid=e=>e.a+'|'+e._ai+'|'+e.b+'|'+e._bi;
+function persist(){try{localStorage.setItem(KEY,JSON.stringify({pos,annos,view,uid,nodeScale,
+ edges:EDGES.map(e=>({id:_eid(e),bend:e.bend,ai:e.ai,bi:e.bi,aOff:e.aOff,bOff:e.bOff,laOff:e.laOff,lbOff:e.lbOff}))}));}catch(e){}}
+function restore(){try{const s=JSON.parse(localStorage.getItem(KEY));if(s){
+ const ids=new Set(NODES.map(n=>n.id));
+ pos={};for(const k in (s.pos||{}))if(ids.has(k))pos[k]=s.pos[k];
+ annos=s.annos||[];if(s.view)view=s.view;uid=s.uid||1;if(s.nodeScale)nodeScale=s.nodeScale;
+ if(s.edges){const m={};s.edges.forEach(se=>{if(se&&se.id)m[se.id]=se;});
+  EDGES.forEach(e=>{const se=m[_eid(e)];if(!se)return;
+   if(se.bend!=null)e.bend=se.bend;if(se.ai)e.ai=se.ai;if(se.bi)e.bi=se.bi;
+   if(se.aOff)e.aOff=se.aOff;if(se.bOff)e.bOff=se.bOff;if(se.laOff)e.laOff=se.laOff;if(se.lbOff)e.lbOff=se.lbOff;});}}}catch(e){}}
+function layout(){const w=svg.clientWidth||1000,h=svg.clientHeight||600,cx=w/2-60,cy=h/2-40,R=Math.max(170,72*NODES.length/Math.PI);
+ NODES.forEach((n,i)=>{if(!pos[n.id]){const a=2*Math.PI*i/NODES.length-Math.PI/2;pos[n.id]={x:cx+R*Math.cos(a),y:cy+R*Math.sin(a)};}});}
+
+const nodeEls={},edgeEls=[];
+// EVE-NG style node: a coloured device-icon chip (scaled by nodeScale) with
+// the hostname and mgmt IP labelled beneath it.
+function nodeSvg(n){const g=el('g',{class:'node'});g.style.cursor='grab';const CH=44*nodeScale;
+  if(n.lo0)g.appendChild(txt(0,-CH/2-9,n.lo0,{class:'nlo'}));   // loopback0 above the icon
+  g.appendChild(el('rect',{x:-CH/2,y:-CH/2,width:CH,height:CH,rx:10*nodeScale,fill:COLORS[n.type]||'#c9d1d9',stroke:'#0c141c','stroke-opacity':.35}));
+  const ic=el('g',{transform:'scale('+nodeScale+')'});ic.innerHTML=ICON[cat(n.type)]||'';g.appendChild(ic);
+  g.appendChild(txt(0,CH/2+15,n.id,{class:'nh'}));
+  if(HAS_IP)g.appendChild(txt(0,CH/2+29,n.ip||'—',{class:'nip'}));
+  g.addEventListener('pointerdown',ev=>nodeDown(ev,n.id));return g;}
+function rebuildNodes(){gN.innerHTML='';NODES.forEach(n=>{const g=nodeSvg(n);gN.appendChild(g);nodeEls[n.id]=g;});update();}
+function build(){
+ EDGES.forEach(e=>{
+  const hit=el('path',{fill:'none',stroke:'transparent','stroke-width':16});hit.style.cursor='grab';gE.appendChild(hit);
+  const path=el('path',{class:'edge'+(e.sniffer?' sniff':''),fill:'none'});gE.appendChild(path);
+  const dotA=el('circle',{r:3.6,class:'port'}),dotB=el('circle',{r:3.6,class:'port'});gP.appendChild(dotA);gP.appendChild(dotB);
+  const la=txt(0,0,e.ai,{class:'iflabel'});la.style.cursor='move';gL.appendChild(la);
+  const lb=txt(0,0,e.bi,{class:'iflabel'});lb.style.cursor='move';gL.appendChild(lb);
+  hit.addEventListener('pointerdown',ev=>bendDown(ev,e));
+  dotA.addEventListener('pointerdown',ev=>{ev.stopPropagation();active={type:'endpt',e:e,which:'a'};});
+  dotB.addEventListener('pointerdown',ev=>{ev.stopPropagation();active={type:'endpt',e:e,which:'b'};});
+  la.addEventListener('pointerdown',ev=>{ev.stopPropagation();active={type:'label',e:e,which:'a'};});
+  lb.addEventListener('pointerdown',ev=>{ev.stopPropagation();active={type:'label',e:e,which:'b'};});
+  la.addEventListener('dblclick',ev=>{ev.stopPropagation();const v=prompt('Interface label:',e.ai);if(v!==null){e.ai=v;la.textContent=v;persist();}});
+  lb.addEventListener('dblclick',ev=>{ev.stopPropagation();const v=prompt('Interface label:',e.bi);if(v!==null){e.bi=v;lb.textContent=v;persist();}});
+  edgeEls.push({e,hit,path,dotA,dotB,la,lb});});
+ NODES.forEach(n=>{const g=nodeSvg(n);gN.appendChild(g);nodeEls[n.id]=g;});}
+
+// Curved link: quadratic bezier whose control point bows perpendicular to the
+// straight A-B line. `off` is the bow - auto-fanned for parallel links so they
+// separate, or set manually when the user grabs and bends a link.
+function bz(A,C,B,t){const u=1-t;return{x:u*u*A.x+2*u*t*C.x+t*t*B.x,y:u*u*A.y+2*u*t*C.y+t*t*B.y};}
+// Each link attaches to a device ON THE BORDER OF ITS ICON - never at the centre
+// (where the icon would cover it) and never floating free in the canvas. The
+// anchor is the point at which the line toward the peer device crosses the
+// icon's bounding square, plus a small gap. Parallel links between the same pair
+// are fanned perpendicular so they land on different points of that border.
+//
+// Dragging an endpoint chooses WHICH SIDE of the icon the link leaves from; it
+// is stored as an angle, so the dot stays welded to the icon however the device
+// is moved or scaled. (It used to store a free dx/dy from the cursor, which let
+// the dot be dragged off the icon and stranded in empty space.)
+function iconHalf(){return 22*nodeScale+3;}   // chip is 44*nodeScale square
+function clipIcon(cx,cy,dx,dy){const h=iconHalf(),m=Math.max(Math.abs(dx),Math.abs(dy));
+ if(!m)return{x:cx,y:cy-h};
+ const t=h/m;return{x:cx+dx*t,y:cy+dy*t};}
+function anchor(e,which){
+ const c=pos[which==='a'?e.a:e.b],p=pos[which==='a'?e.b:e.a];
+ const o=(which==='a')?e.aOff:e.bOff;
+ // Only an explicit angle is honoured - a legacy free-floating {dx,dy} offset
+ // saved by an older version is ignored, so old diagrams heal themselves.
+ if(o&&o.ang!=null)return clipIcon(c.x,c.y,Math.cos(o.ang),Math.sin(o.ang));
+ if(!p)return clipIcon(c.x,c.y,0,-1);
+ // Fan parallel links by ANGLE around the icon, not by nudging the direction
+ // vector: the nudge is proportional to link length and the clip normalises it
+ // away, so on a long link the dots ended up ~1px apart and stacked. The total
+ // fan is capped so a device with many parallel links doesn't wrap around.
+ const base=Math.atan2(p.y-c.y,p.x-c.x);
+ const step=Math.min(FAN,FAN_MAX/Math.max(1,e._n-1));
+ const ang=base+(e._i-(e._n-1)/2)*step;
+ return clipIcon(c.x,c.y,Math.cos(ang),Math.sin(ang));}
+function endptA(e){return anchor(e,'a');}
+function endptB(e){return anchor(e,'b');}
+function endpoints(e){return[endptA(e),endptB(e)];}
+
+function applyView(){vp.setAttribute('transform','translate('+view.x+','+view.y+') scale('+view.k+')');}
+function update(){applyView();
+ const BOW=16;
+ edgeEls.forEach(function(o){const e=o.e;if(!pos[e.a]||!pos[e.b])return;
+  const A=endptA(e),B=endptB(e);
+  const dx=B.x-A.x,dy=B.y-A.y,L=Math.hypot(dx,dy)||1,px=-dy/L,py=dx/L;
+  const off=(e.bend!==undefined && e.bend!==null)?e.bend:(e._i-(e._n-1)/2)*BOW;
+  const C={x:(A.x+B.x)/2+px*off*2,y:(A.y+B.y)/2+py*off*2};
+  const d='M'+A.x+' '+A.y+' Q'+C.x+' '+C.y+' '+B.x+' '+B.y;
+  o.path.setAttribute('d',d);o.hit.setAttribute('d',d);
+  o.dotA.setAttribute('cx',A.x);o.dotA.setAttribute('cy',A.y);o.dotB.setAttribute('cx',B.x);o.dotB.setAttribute('cy',B.y);
+  // labels: custom position (relative to their end, so they follow the node) or default along the curve
+  const la=e.laOff?{x:A.x+e.laOff.dx,y:A.y+e.laOff.dy}:(function(){const p=bz(A,C,B,0.25);return{x:p.x,y:p.y-5};})();
+  const lb=e.lbOff?{x:B.x+e.lbOff.dx,y:B.y+e.lbOff.dy}:(function(){const p=bz(A,C,B,0.75);return{x:p.x,y:p.y-5};})();
+  o.la.setAttribute('x',la.x);o.la.setAttribute('y',la.y);o.lb.setAttribute('x',lb.x);o.lb.setAttribute('y',lb.y);});
+ NODES.forEach(n=>{nodeEls[n.id].setAttribute('transform','translate('+pos[n.id].x+','+pos[n.id].y+')');});}
+
+function drawAnnos(){gZ.innerHTML='';gT.innerHTML='';
+ annos.forEach(a=>{
+  if(a.kind==='zone'){const g=el('g',{transform:'translate('+a.x+','+a.y+')'});g.dataset.id=a.id;
+   g.appendChild(el('rect',{x:0,y:0,width:a.w,height:a.h,rx:10,fill:a.color,'fill-opacity':.10,stroke:a.color,'stroke-opacity':.7,'stroke-dasharray':'7 5','stroke-width':sel===a.id?2:1.4}));
+   g.appendChild(txt(11,21,a.label||'zone',{fill:a.color,'font-size':13,'font-weight':500}));
+   const hl=el('rect',{x:a.w-14,y:a.h-14,width:11,height:11,rx:2,fill:a.color,class:'rsz'});g.appendChild(hl);
+   g.addEventListener('pointerdown',ev=>annoDown(ev,a));
+   hl.addEventListener('pointerdown',ev=>zoneResize(ev,a));
+   g.addEventListener('dblclick',ev=>{ev.stopPropagation();const v=prompt('Zone label:',a.label||'');if(v!==null){a.label=v;drawAnnos();persist();}});
+   gZ.appendChild(g);
+  }else{const g=el('g',{transform:'translate('+a.x+','+a.y+')'});g.dataset.id=a.id;
+   const t=txt(0,0,a.text,{fill:a.color,'font-size':a.size||15,'font-weight':500});
+   if(sel===a.id){t.setAttribute('stroke','#5ac8fa');t.setAttribute('stroke-width',.5);}
+   g.appendChild(t);
+   g.addEventListener('pointerdown',ev=>annoDown(ev,a));
+   g.addEventListener('dblclick',ev=>{ev.stopPropagation();const v=prompt('Text:',a.text);if(v!==null){a.text=v;drawAnnos();persist();}});
+   gT.appendChild(g);}});}
+
+function worldOf(ev){const r=svg.getBoundingClientRect();return{x:(ev.clientX-r.left-view.x)/view.k,y:(ev.clientY-r.top-view.y)/view.k};}
+function moveAnnoEl(a){const g=(a.kind==='zone'?gZ:gT).querySelector('[data-id="'+a.id+'"]');if(g)g.setAttribute('transform','translate('+a.x+','+a.y+')');}
+function nodeDown(ev,id){ev.stopPropagation();if(sel){sel=null;drawAnnos();}const w=worldOf(ev);active={type:'node',id:id,dx:pos[id].x-w.x,dy:pos[id].y-w.y};}
+function annoDown(ev,a){if(tool!=='select')return;ev.stopPropagation();sel=a.id;drawAnnos();const w=worldOf(ev);active={type:'anno',a:a,dx:a.x-w.x,dy:a.y-w.y};}
+function zoneResize(ev,a){ev.stopPropagation();sel=a.id;active={type:'resize',a:a};}
+function bendDown(ev,e){if(tool!=='select')return;ev.stopPropagation();if(sel){sel=null;drawAnnos();}active={type:'bend',e:e};}
+
+svg.addEventListener('pointerdown',ev=>{
+ if(ev.target.closest('[data-id]')||ev.target.closest('.node'))return;
+ if(tool==='text'||tool==='zone'){placeAnno(worldOf(ev));return;}
+ if(sel){sel=null;drawAnnos();}
+ active={type:'pan',sx:ev.clientX,sy:ev.clientY,vx:view.x,vy:view.y};});
+svg.addEventListener('pointermove',ev=>{if(!active)return;
+ if(active.type==='pan'){view.x=active.vx+(ev.clientX-active.sx);view.y=active.vy+(ev.clientY-active.sy);applyView();return;}
+ const w=worldOf(ev);
+ if(active.type==='node'){pos[active.id]={x:w.x+active.dx,y:w.y+active.dy};update();}
+ else if(active.type==='anno'){active.a.x=w.x+active.dx;active.a.y=w.y+active.dy;moveAnnoEl(active.a);}
+ else if(active.type==='resize'){active.a.w=Math.max(70,w.x-active.a.x);active.a.h=Math.max(46,w.y-active.a.y);drawAnnos();}
+ else if(active.type==='bend'){const e=active.e,ep=endpoints(e),A=ep[0],B=ep[1];const dx=B.x-A.x,dy=B.y-A.y,L=Math.hypot(dx,dy)||1,px=-dy/L,py=dx/L,mx=(A.x+B.x)/2,my=(A.y+B.y)/2;
+   e.bend=(w.x-mx)*px+(w.y-my)*py;update();}
+ else if(active.type==='endpt'){const e=active.e,c=pos[active.which==='a'?e.a:e.b],o={ang:Math.atan2(w.y-c.y,w.x-c.x)};if(active.which==='a')e.aOff=o;else e.bOff=o;update();}
+ else if(active.type==='label'){const e=active.e,A=(active.which==='a')?endptA(e):endptB(e),o={dx:w.x-A.x,dy:w.y-A.y};if(active.which==='a')e.laOff=o;else e.lbOff=o;update();}});
+window.addEventListener('pointerup',()=>{if(active){if(active.type!=='pan')persist();active=null;}});
+svg.addEventListener('wheel',ev=>{ev.preventDefault();const r=svg.getBoundingClientRect(),mx=ev.clientX-r.left,my=ev.clientY-r.top,f=ev.deltaY<0?1.1:1/1.1,nk=Math.min(3,Math.max(.3,view.k*f));view.x=mx-(mx-view.x)*(nk/view.k);view.y=my-(my-view.y)*(nk/view.k);view.k=nk;applyView();persist();},{passive:false});
+
+function placeAnno(w){const id='a'+(uid++);
+ if(tool==='text'){const a={id:id,kind:'text',x:w.x,y:w.y,text:'text',color:curColor,size:15};annos.push(a);sel=id;drawAnnos();
+  const v=prompt('Text:',a.text);if(v===null){annos=annos.filter(x=>x.id!==id);sel=null;}else a.text=v||'text';drawAnnos();}
+ else{annos.push({id:id,kind:'zone',x:w.x,y:w.y,w:240,h:150,color:curColor,label:'zone'});sel=id;drawAnnos();}
+ setTool('select');persist();}
+function delSel(){if(!sel)return;annos=annos.filter(a=>a.id!==sel);sel=null;drawAnnos();persist();}
+window.addEventListener('keydown',ev=>{if((ev.key==='Delete'||ev.key==='Backspace')&&sel){ev.preventDefault();delSel();}});
+
+function setTool(t){tool=t;document.querySelectorAll('.tool').forEach(b=>b.classList.toggle('on',b.dataset.tool===t));svg.style.cursor=(t==='select')?'grab':'crosshair';}
+document.querySelectorAll('.tool').forEach(b=>b.addEventListener('click',()=>setTool(b.dataset.tool)));
+const pal=document.getElementById('palette');
+PALETTE.forEach(c=>{const s=document.createElement('button');s.className='sw';s.style.background=c;s.title=c;
+ s.addEventListener('click',()=>{curColor=c;if(sel){const a=annos.find(x=>x.id===sel);if(a){a.color=c;drawAnnos();persist();}}});pal.appendChild(s);});
+document.getElementById('szup').addEventListener('click',()=>{nodeScale=Math.min(2.4,nodeScale+0.2);rebuildNodes();persist();});
+document.getElementById('szdn').addEventListener('click',()=>{nodeScale=Math.max(0.6,Math.round((nodeScale-0.2)*10)/10);rebuildNodes();persist();});
+document.getElementById('del').addEventListener('click',delSel);
+document.getElementById('reset').addEventListener('click',()=>{try{localStorage.removeItem(KEY);}catch(e){}
+ EDGES.forEach(e=>{delete e.bend;delete e.aOff;delete e.bOff;delete e.laOff;delete e.lbOff;e.ai=e._ai;e.bi=e._bi;});
+ edgeEls.forEach(o=>{o.la.textContent=o.e.ai;o.lb.textContent=o.e.bi;});
+ pos={};annos=[];view={x:60,y:60,k:1};uid=1;nodeScale=1;layout();rebuildNodes();update();drawAnnos();});
+
+function exportSVG(){const W=svg.clientWidth,H=svg.clientHeight,clone=svg.cloneNode(true);
+ clone.setAttribute('width',W);clone.setAttribute('height',H);clone.setAttribute('viewBox','0 0 '+W+' '+H);
+ clone.insertBefore(el('rect',{x:0,y:0,width:W,height:H,fill:'#0f1720'}),clone.firstChild);
+ return new XMLSerializer().serializeToString(clone);}
+function dl(name,blob){const u=URL.createObjectURL(blob),a=document.createElement('a');a.href=u;a.download=name;document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(u);}
+document.getElementById('svgb').addEventListener('click',()=>dl('topology.svg',new Blob([exportSVG()],{type:'image/svg+xml'})));
+document.getElementById('pngb').addEventListener('click',()=>{const W=svg.clientWidth,H=svg.clientHeight,xml=exportSVG(),img=new Image();
+ img.onload=()=>{const c=document.createElement('canvas');c.width=W*2;c.height=H*2;const x=c.getContext('2d');x.scale(2,2);x.drawImage(img,0,0);c.toBlob(b=>dl('topology.png',b));};
+ img.src='data:image/svg+xml;charset=utf-8,'+encodeURIComponent(xml);});
+
+restore();layout();build();update();drawAnnos();setTool('select');
+
+// Live refresh: when served, poll /data and update mgmt IP + lo0 labels in
+// place so loopbacks configured/changed after boot appear automatically.
+function poll(){
+  fetch('data').then(r=>r.json()).then(d=>{
+    let changed=false;
+    NODES.forEach(n=>{const s=d[n.id]; if(!s)return;
+      if((s.ip||'')!==(n.ip||'')){n.ip=s.ip||'';changed=true;}
+      if((s.lo0||'')!==(n.lo0||'')){n.lo0=s.lo0||'';changed=true;}});
+    if(changed){ HAS_IP=NODES.some(n=>n.ip); rebuildNodes(); }
+  }).catch(()=>{});
+}
+if(location.protocol!=='file:'){ setTimeout(poll,1500); setInterval(poll,10000); }
+</script>
+</body></html>
+"""
 
 
 # -----------------------------
 # Main workflow
 # -----------------------------
 def main():
-    print("Install the required libraries if not already done:please use --> pip3 install pyyaml jinja2  junos-eznc paramiko")
+    # To stderr so data-producing modes (e.g. --print_devices) can be piped or
+    # redirected to a file without this banner polluting stdout.
+    print("Install the required libraries if not already done:please use --> pip3 install pyyaml jinja2  junos-eznc paramiko", file=sys.stderr)
     parser = argparse.ArgumentParser(description="A tool to deploy and configure a VMM lab from a YAML topology.")
     parser.add_argument("-t", "--topology", default="topo.yml", help="Path to the YAML topology file (default: topo.yml)")
     parser.add_argument("-o", "--output", default="lab_topology.conf", help="Name of the output configuration file")
     parser.add_argument("--lab_detail", action="store_true", help="Display lab summary table and exit.")
     parser.add_argument("--config", action="store_true", help="Enter configuration management mode.")
     parser.add_argument("--config_file_only", action="store_true", help="Generate the VMM config file only and exit.")
+    parser.add_argument("--force", action="store_true", help="Deploy even if the lab looks too big for the pod's free capacity.")
     parser.add_argument("--skip_boot_wait", action="store_true",
                         help="Skip the Phase 3 ping wait entirely and go straight to configuration. "
                              "Safe because devices are configured over the serial console, which "
                              "has its own boot/login retry handling.")
     parser.add_argument("--boot_wait", type=int, default=900, metavar="SECONDS",
                         help="Hard cap on the Phase 3 ping wait (default: 900).")
+    parser.add_argument("--ping_grace", type=int, default=420, metavar="SECONDS",
+                        help="How long Phase 3 waits for the FIRST device to answer 'vmm ping' "
+                             "before giving up and handing off to the serial login (default: 420). "
+                             "Slow TVP images (vHamilton/vMX10004, vFerrari) take ~5-6 min to boot "
+                             "and pull a mgmt IP; a value below that makes Phase 3 hand off early, "
+                             "so Phase 4 then sits through the boot on the serial console.")
     parser.add_argument("--debug", action="store_true",
                         help="Stream the full serial console dialogue for each device during "
                              "Phase 4. Use this when a device appears stuck to see exactly where "
                              "its login/commit is waiting.")
+    parser.add_argument("--interfaces", action="store_true",
+                        help="Print the valid interfaces for every device in the topology and exit "
+                             "(a per-device cheat sheet - no need to remember et-/ge-/xe-).")
+    parser.add_argument("--print_devices", dest="print_devices", action="store_true",
+                        help="Print every Junos device as a junos-mcp-server devices.json map "
+                             "(hostname -> ip/port/username/password) and exit. IPs come from "
+                             "'vmm ping'. Redirect to a file: --print_devices > devices.json.")
+    parser.add_argument("--diagram", nargs="?", const="topology.html", metavar="FILE",
+                        help="Generate an interactive, draggable topology diagram (self-contained "
+                             "HTML, default 'topology.html') from the links and exit. Every link is "
+                             "labelled with the interface at each end.")
+    parser.add_argument("--serve", action="store_true",
+                        help="Start the topology diagram web server in the BACKGROUND (detached; prints "
+                             "the URL and returns immediately, keeps running in parallel). Serve-only - "
+                             "does not deploy. Stop it with --serve-stop.")
+    parser.add_argument("--serve-bg", dest="serve_bg", action="store_true",
+                        help="Alias for --serve (background web server).")
+    parser.add_argument("--serve-fg", dest="serve_fg", action="store_true",
+                        help=argparse.SUPPRESS)   # internal: the foreground worker spawned by --serve
+    parser.add_argument("--serve-stop", dest="serve_stop", action="store_true",
+                        help="Stop the background topology web server.")
+    parser.add_argument("--port", type=int, default=8080, metavar="PORT",
+                        help="Port for --serve (default 8080).")
     args = parser.parse_args()
+
+    # --- Web server: decoupled from deploy, runs in the background ---
+    if args.serve_stop:
+        stop_topology_server()
+        sys.exit(0)
+    if args.serve_fg:                        # detached child process: block and serve
+        serve_topology_diagram(args.topology, args.port)
+        sys.exit(0)
+    if args.serve or args.serve_bg:          # user-facing: launch the background server, return
+        start_topology_server_bg(args.topology, args.port)
+        sys.exit(0)
+
+    if args.interfaces:
+        print_interfaces(args.topology)
+        sys.exit(0)
+
+    if args.print_devices:
+        print_devices(args.topology)
+        sys.exit(0)
+
+    if args.diagram:
+        generate_topology_diagram(args.topology, args.diagram)
+        sys.exit(0)
 
     if args.config_file_only:
         print("NOTE: --config_file_only flag detected.")
@@ -1770,13 +3040,14 @@ def main():
 
     # --- Normal execution flow ---
     topology_data, final_summary_mappings, capture_mappings = generate_config(args.topology, args.output)
-    run_vmm_config(args.output)
+    run_vmm_config(args.output, force=args.force)
     
     if args.skip_boot_wait:
         print("\n⏭️  Skipping the boot wait (--skip_boot_wait); serial consoles "
               "retry on their own until each device is ready.")
     else:
-        monitor_vms(configurable_devices(topology_data), timeout=args.boot_wait)
+        monitor_vms(configurable_devices(topology_data), timeout=args.boot_wait,
+                    no_response_timeout=args.ping_grace)
 
 
     time.sleep(5)
@@ -1793,9 +3064,17 @@ def main():
     SERIAL_WORKERS = {
         'vrouter':  configure_vjunos_serial,
         'vswitch':  configure_vjunos_serial,
-        'vptx':     configure_vptx_serial,
         'vscapa':   configure_vscapa_serial,
-        'vbrackla': configure_vbrackla_serial,
+        # vmm3 vbrackla's RE is '{host}_RE0' (not the old '-vBrackla_RE0'), and it
+        # takes the same re0:mgmt-0 baseline as vscapa, so it reuses that worker.
+        'vbrackla': configure_vscapa_serial,
+        # vbalerion / vardbeg / vbowmore are all EVO PTX REs with re0:mgmt-0
+        # mgmt and the same '{name}_RE0' console convention as vscapa, so they
+        # reuse that worker. (vardbeg comes up via EVOvArdbegRE, vbowmore via
+        # the stock EVOVPTX_RE0_* macros - both land on the same console.)
+        'vbalerion': configure_vscapa_serial,
+        'vardbeg':   configure_vscapa_serial,
+        'vbowmore':  configure_vscapa_serial,
     }
 
     # The vmx-family types all use configure_vmx_serial but each takes a
@@ -1804,6 +3083,10 @@ def main():
         'vmx':        VMX_BASELINE_LINES,
         'vferrari':   VFERRARI_BASELINE_LINES,
         'valfaromeo': VALFAROMEO_BASELINE_LINES,
+        'vhamilton':  VHAMILTON_BASELINE_LINES,
+        # vMaserati is the same vMX10004 RE as vHamilton (RE-TVP, em0 mgmt),
+        # only the linecard differs, so it reuses the vHamilton baseline.
+        'vmaserati':  VHAMILTON_BASELINE_LINES,
     }
 
     # vqfx is the only type configured over telnet, so it is the only one that
@@ -1824,9 +3107,23 @@ def main():
         host = vm['hostname']
         vtype = vm.get('type')
         interfaces = vm.get('interfaces', [])
-        if vtype in VMX_FAMILY_BASELINE:
+        if vtype == 'vbugatti':
+            # vBugatti (MX304) gets the vJunosRouter init config. The template
+            # emits VMX304_RE_START(<hostname>-re0, 0), so its console is
+            # '{host}-re0' - NOT the '{host}_RE' the rest of the vmx family
+            # uses. Getting this wrong makes the serial login sit until it
+            # times out and the RE never resolves in 'vmm ping'.
             plan.append((host, vtype, functools.partial(
-                configure_vmx_serial, host, interfaces, VMX_FAMILY_BASELINE[vtype], debug=debug)))
+                configure_vjunos_serial, host, interfaces, debug=debug,
+                re_name=f"{host}-re0")))
+        elif vtype in VMX_FAMILY_BASELINE:
+            # valfaromeo's template emits VMX10008_RE_START(<hostname>-re0, 0),
+            # so it needs the same '-re0' console override as vbugatti. vmx /
+            # vferrari / vhamilton all use the default '{host}_RE'.
+            plan.append((host, vtype, functools.partial(
+                configure_vmx_serial, host, interfaces, VMX_FAMILY_BASELINE[vtype],
+                debug=debug,
+                re_name=f"{host}-re0" if vtype == 'valfaromeo' else None)))
         elif vtype in SERIAL_WORKERS:
             plan.append((host, vtype, functools.partial(
                 SERIAL_WORKERS[vtype], host, interfaces, debug=debug)))
@@ -1873,6 +3170,8 @@ def main():
     print("\n🎉 All configuration tasks complete.")
     print_summary_table(topology_data)
     print_capture_info_table(final_summary_mappings)
+    print("\nℹ️  To view/edit the topology in a browser, start the web server (it "
+          "runs in the background): python3 vmm.py -t " + args.topology + " --serve")
 
 if __name__ == "__main__":
     main()
