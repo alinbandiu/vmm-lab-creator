@@ -220,14 +220,190 @@ RETIRED_VM_TYPES = {
 # regression fails at generation time instead of after a deploy.
 INCOMPATIBLE_TYPE_GROUPS = []
 
+# Legal device hostnames.
+# ----------------------
+# A hostname is not cosmetic - it is reused verbatim in three places that each
+# constrain it, so an unconstrained name fails *after* a 20-minute deploy:
+#
+#   1. 'set system host-name <name>' is pushed to the device over the serial
+#      console. Whitespace makes Junos read the tail as extra arguments, the
+#      commit fails, and the device is left unconfigured.
+#   2. 'vmm ping' output is parsed by whitespace column (get_vmm_ip_map /
+#      get_vmm_ping_map). A name containing a space shifts every column, so the
+#      wrong IP - or no IP - is read back, silently.
+#   3. The template token-pastes it into VMM macro arguments, e.g.
+#      VMX_RE_INSTANCE({{ vm.hostname }}_RE, ...).
+#
+# 'vmm config' itself accepts all of these (measured on q-pod32: dash, dot,
+# leading digit and even a space all pass), so VMM will NOT catch it for us.
+# Letters/digits/'_'/'-' starting with a letter covers every realistic lab name
+# (R1, PE1, CE-2, core_rtr) while keeping all three consumers safe.
+HOSTNAME_RE = re.compile(r'[A-Za-z][A-Za-z0-9_-]*')
+
+# WHERE THESE RANGES COME FROM (do not widen them from the alias tables!)
+# ---------------------------------------------------------------------
+# For the vmm3 EVO platforms the IF_ET_X_0_<port> alias tables are a
+# SUPERSET of the ports Junos actually exposes. The real port list is set
+# by the platform's CSPP/cosim config, which maps host vNICs to PFE ports:
+#     /vmm/data/vmm-configs/common/vptxc/cspp_cfg/<PLATFORM>/*_cspp.conf*
+# Its "Interfaces mapping" section lists eth1 (the LCPU host port, not a
+# data port) followed by the data vNICs. The generator instantiates ONE
+# CSPP/PFE per chassis, so the valid set comes from conf.0, and:
+#
+#     Junos et-<fpc>/0/<N>   <->   IF_ET_X_<pic>_<N>   <->   eth<N+4>
+#
+# Verified against live devices: vScapa/vBowmore eth5,7,..,19 -> odd 1-15;
+# vBalerion eth13..30 -> 9-26; vArdbeg eth4..15 -> 0-11; vBrackla eth4..8
+# -> 0-4. Wiring a port outside this set is NOT a config error - VMM
+# happily builds the bridge and the vNIC, but no Junos interface is ever
+# bound to it, so the link is silently dead (peer shows link-up, no
+# traffic, no LLDP neighbour). That bug cost a full deployment cycle.
+#
+# Module-level so the web builder (--build) can reuse the *same* rules the
+# CLI validator uses. Never duplicate these in JavaScript.
+INTERFACE_PATTERNS = {
+    'vrouter': re.compile(r'^ge-0/0/\d+$'),
+    'vswitch': re.compile(r'^ge-0/0/\d+$'),
+    'vqfx': re.compile(r'^xe-0/0/\d+$'),
+    'server': re.compile(r'^em\d+$'),
+    # vScapa (vmm3 EVOvScapa): RAW EVOVPTX_CONNECT(IF_ET(0,0,<port>)).
+    # Junos exposes only the 8 ODD ports et-0/0/1,3,5,7,9,11,13,15
+    # (verified on a live vScapa). The shared IF_ET_X_0_<port> alias table
+    # runs 0-35, but any port outside that odd set is never bound inside
+    # Junos: VMM still builds the bridge and the vNIC, so the peer sees
+    # link-up while no traffic passes -> silently dead link.
+    'vscapa': re.compile(r'^et-0/0/(1|3|5|7|9|11|13|15)$'),
+    # vBrackla (vmm3): FPC1, RAW EVOVPTX_CONNECT(IF_ET(1,0,<port>)) -> et-1/0/<port>
+    # (no channel suffix on vmm3; the reference wires et-1/0/0). Only 5 data
+    # ports: its CSPP config (EVOvBRACKLA/COSIMPP/vbrackla_cspp.conf, named
+    # by BRACKLACHAN in common.brackla.defs) maps eth4..eth8 -> et-1/0/0..4.
+    'vbrackla': re.compile(r'^et-1/0/[0-4]$'),
+    # vFerrari: 5 fixed 100G ports on FPC0, not channelized. Emitted as
+    # VMX_CONNECT(ET(fpc,pic,port,0), ...) - same macro family as vmx.
+    'vferrari': re.compile(r'^et-0/0/[0-4]$'),
+    # vBugatti (vMX304 + LC304): 16 x 100G ports on FPC0, numbered 0-15.
+    # Verified on a live vBugatti, and the LC304_IF_ET_100G_X_0_<port>
+    # alias table is likewise 0-15. Emitted as
+    # LC304_CONNECT(LC304_IF_ET_100G(0,0,<port>), ...).
+    'vbugatti': re.compile(r'^et-0/0/([0-9]|1[0-5])$'),
+    # vHamilton (vMX10004 + vHamilton LCs): 14 ports per linecard, numbered
+    # from 0 (et-<fpc>/0/0 .. et-<fpc>/0/13), on up to 3 linecards FPC0-FPC2.
+    # Emitted as VHAMILTON_CONNECT(IF_ET(<fpc>,0,<port>), ...), one
+    # VHAMILTON_FPC block per FPC used (same shape as vAlfaRomeo).
+    'vhamilton': re.compile(r'^et-[0-2]/0/([0-9]|1[0-3])$'),
+    # vMaserati (vMX10004 + vMaserati LC, "XT"): TWO pics on one linecard -
+    # pic0 has 20 ports (et-<fpc>/0/0 .. et-<fpc>/0/19) and pic1 has 16
+    # (et-<fpc>/1/0 .. et-<fpc>/1/15). Unlike the EVO/CSPP platforms the full
+    # alias table really is wired: the shipped reference topology
+    # /vmm/data/user_disks/vmaserati/vmaserati-1router-mx10k4.config connects
+    # all 36 of them, so this range is the vendor's own list, not a guess.
+    # Alias mapping is VMASERATI_IF_ET_X_0_N -> vio<N+4> and
+    # VMASERATI_IF_ET_X_1_N -> vio<N+24> (vio, not eth).
+    # Emitted as VMASERATI_CONNECT(IF_ET(<fpc>,<pic>,<port>), ...) with the
+    # matching '#undef IF_ET_X_<pic>_<port>' - same PREFIXED handling as
+    # vHamilton/vAlfaRomeo.
+    'vmaserati': re.compile(r'^et-[0-2]/(0/([0-9]|1[0-9])|1/([0-9]|1[0-5]))$'),
+    # vBalerion (vmm3 EVO PTX): FPC0 linecard, ports et-0/0/9 .. et-0/0/26.
+    # Emitted as VBALERION_CONNECT(IF_ET(0,0,<port>), ...); the template also
+    # emits '#undef IF_ET_X_0_<port>' per port so the prefix-paste doesn't
+    # expand the unprefixed alias into junk (VBALERION_eth13).
+    'vbalerion': re.compile(r'^et-0/0/(9|1[0-9]|2[0-6])$'),
+    # vAlfaRomeo: 4 ports x 4 channelized subports per FPC, on FPC0, FPC1
+    # and FPC2 (up to 3 linecards). Emitted as
+    # VALFAROMEO_CONNECT(IF_ET_CHAN(fpc,pic,port,subport)), one
+    # VALFAROMEO_FPC block per FPC used.
+    'valfaromeo': re.compile(r'^et-[0-2]/0/[0-3]:[0-3]$'),
+    # vArdbeg (vmm3 EVO PTX): RAW connect - EVOVPTX_CONNECT(IF_ET(0,0,<port>)).
+    # The shared unprefixed IF_ET_X_0_<port> table runs to 35, but Junos
+    # only exposes et-0/0/0 .. et-0/0/11 (12 contiguous ports, verified on
+    # a live vArdbeg). Ports 12-35 exist as aliases only -> dead links.
+    'vardbeg': re.compile(r'^et-0/0/([0-9]|1[01])$'),
+    # vBowmore (vmm3 EVO PTX): PREFIXED connect - VBOWMORE_CONNECT pastes
+    # onto IF_ET_X_0_<port>. Same port layout as vScapa: Junos exposes only
+    # the 8 ODD ports et-0/0/1,3,...,15 (verified on a live vBowmore; its
+    # alias table is byte-identical to vScapa's). An even port yields a
+    # silently dead link - this is exactly what broke a real deployment.
+    'vbowmore': re.compile(r'^et-0/0/(1|3|5|7|9|11|13|15)$'),
+}
+
+
+# -----------------------------
+# Enumerable port catalog (drives the web builder's port dropdowns)
+# -----------------------------
+# INTERFACE_PATTERNS above can *validate* an interface name but cannot *list*
+# the legal ones, and the GUI needs a list. These two must never disagree: an
+# entry offered here but rejected by the validator would be a trap, which is
+# precisely the class of bug this project keeps getting bitten by. The
+# assertion at the bottom of this block enforces catalog subset-of-regex on
+# every import, so a drift is a startup crash, not a dead link found after a
+# 20-minute deploy.
+#
+# For the growable ge-/xe-/em ranges the regex is open-ended; we expose a
+# practical slice for the dropdown rather than an infinite list.
+def _build_port_catalog():
+    cat = {}
+
+    cat['server']   = [f"em{n}" for n in range(1, 9)]
+    cat['vswitch']  = [f"ge-0/0/{n}" for n in range(16)]
+    cat['vrouter']  = [f"ge-0/0/{n}" for n in range(16)]
+    cat['vqfx']     = [f"xe-0/0/{n}" for n in range(12)]
+
+    # Fixed hardware catalogs - these are the verified real port lists.
+    cat['vmx']      = list(VMX_INTERFACE_CATALOG.keys())
+    cat['vferrari'] = [f"et-0/0/{n}" for n in range(5)]
+    cat['vbugatti'] = [f"et-0/0/{n}" for n in range(16)]
+    cat['vardbeg']  = [f"et-0/0/{n}" for n in range(12)]
+    cat['vbrackla'] = [f"et-1/0/{n}" for n in range(5)]          # FPC1, not FPC0
+    cat['vbalerion'] = [f"et-0/0/{n}" for n in range(9, 27)]     # starts at 9
+    cat['vscapa']   = [f"et-0/0/{n}" for n in range(1, 16, 2)]   # ODD only
+    cat['vbowmore'] = [f"et-0/0/{n}" for n in range(1, 16, 2)]   # ODD only
+
+    # Multi-FPC linecards: FPC0-FPC2.
+    cat['vhamilton'] = [f"et-{f}/0/{n}" for f in range(3) for n in range(14)]
+    cat['vmaserati'] = ([f"et-{f}/0/{n}" for f in range(3) for n in range(20)] +
+                        [f"et-{f}/1/{n}" for f in range(3) for n in range(16)])
+    cat['valfaromeo'] = [f"et-{f}/0/{p}:{s}"
+                         for f in range(3) for p in range(4) for s in range(4)]
+    return cat
+
+
+PORT_CATALOG = _build_port_catalog()
+
+# Fail fast if the catalog and the validator ever diverge.
+for _t, _ports in PORT_CATALOG.items():
+    if _t == 'vmx':
+        continue  # validated against VMX_INTERFACE_CATALOG membership, not a regex
+    _rx = INTERFACE_PATTERNS.get(_t)
+    if _rx is None:
+        raise RuntimeError(f"PORT_CATALOG has type '{_t}' with no INTERFACE_PATTERNS entry")
+    _bad = [p for p in _ports if not _rx.match(p)]
+    if _bad:
+        raise RuntimeError(
+            f"PORT_CATALOG/INTERFACE_PATTERNS drift for '{_t}': "
+            f"{_bad[:5]} would be offered by the GUI but rejected by the validator"
+        )
+if set(PORT_CATALOG) != SUPPORTED_VM_TYPES:
+    raise RuntimeError(
+        f"PORT_CATALOG does not cover every supported type: "
+        f"missing={sorted(SUPPORTED_VM_TYPES - set(PORT_CATALOG))} "
+        f"extra={sorted(set(PORT_CATALOG) - SUPPORTED_VM_TYPES)}"
+    )
+
+
+
 # -----------------------------
 # Topology Validation Function
 # -----------------------------
 
-def validate_topology(data):
+def collect_topology_errors(data):
     """
-    Performs semantic validation of the topology data from the YAML file.
-    Checks for disk naming conventions, interface naming, and sequential interface usage.
+    Semantic validation of a parsed topology dict. Returns a sorted list of
+    human-readable error strings (empty list == valid).
+
+    This is the single source of truth for topology rules. It is pure: it
+    neither prints nor exits, so the web builder (--build) can call it per
+    keystroke and render the same errors the CLI reports. validate_topology()
+    below is the CLI wrapper that prints and aborts.
     """
     errors = []
     # Use a dictionary comprehension for quick VM lookup
@@ -277,6 +453,36 @@ def validate_topology(data):
                 f"Supported types: {', '.join(sorted(SUPPORTED_VM_TYPES))}."
             )
 
+    # 0b. Hostname checks.
+    # Duplicates were previously invisible: vms_by_hostname above is a dict, so a
+    # repeated hostname silently collapses to one entry and every link endpoint
+    # resolves to whichever VM happened to be last. The config still generates
+    # and still deploys - with a device missing. Now that names are typed by hand
+    # in the builder rather than auto-numbered, this is easy to hit.
+    seen_hosts = set()
+    for vm in data.get('vms', []):
+        host = vm.get('hostname')
+        if host is None or str(host).strip() == '':
+            errors.append(
+                f"A VM of type '{vm.get('type')}' has no hostname. Every VM needs a "
+                f"unique 'hostname'."
+            )
+            continue
+        host = str(host)
+        if host in seen_hosts:
+            errors.append(
+                f"Duplicate hostname '{host}'. Every VM needs a unique hostname - "
+                f"link endpoints are matched by name, so a repeat silently drops a device."
+            )
+        seen_hosts.add(host)
+        if not HOSTNAME_RE.fullmatch(host):
+            errors.append(
+                f"Hostname '{host}' is not usable. Use letters, digits, '-' or '_', "
+                f"starting with a letter (e.g. R1, PE1, CE-2, core_rtr). The name is "
+                f"pushed as 'set system host-name' and is parsed back out of "
+                f"'vmm ping' by column, so spaces and punctuation break the deploy."
+            )
+
     for group_a, group_b, reason in INCOMPATIBLE_TYPE_GROUPS:
         hit_a = sorted(group_a & present_types)
         hit_b = sorted(group_b & present_types)
@@ -301,88 +507,7 @@ def validate_topology(data):
                 errors.append(f"VM '{vm['hostname']}' (type: {vm_type}) uses disk '{disk_alias}'. Disk alias must start with '{vm_type}'.")
 
     # Prepare for interface checks
-    # WHERE THESE RANGES COME FROM (do not widen them from the alias tables!)
-    # ---------------------------------------------------------------------
-    # For the vmm3 EVO platforms the IF_ET_X_0_<port> alias tables are a
-    # SUPERSET of the ports Junos actually exposes. The real port list is set
-    # by the platform's CSPP/cosim config, which maps host vNICs to PFE ports:
-    #     /vmm/data/vmm-configs/common/vptxc/cspp_cfg/<PLATFORM>/*_cspp.conf*
-    # Its "Interfaces mapping" section lists eth1 (the LCPU host port, not a
-    # data port) followed by the data vNICs. The generator instantiates ONE
-    # CSPP/PFE per chassis, so the valid set comes from conf.0, and:
-    #
-    #     Junos et-<fpc>/0/<N>   <->   IF_ET_X_<pic>_<N>   <->   eth<N+4>
-    #
-    # Verified against live devices: vScapa/vBowmore eth5,7,..,19 -> odd 1-15;
-    # vBalerion eth13..30 -> 9-26; vArdbeg eth4..15 -> 0-11; vBrackla eth4..8
-    # -> 0-4. Wiring a port outside this set is NOT a config error - VMM
-    # happily builds the bridge and the vNIC, but no Junos interface is ever
-    # bound to it, so the link is silently dead (peer shows link-up, no
-    # traffic, no LLDP neighbour). That bug cost a full deployment cycle.
-    interface_patterns = {
-        'vrouter': re.compile(r'^ge-0/0/\d+$'),
-        'vswitch': re.compile(r'^ge-0/0/\d+$'),
-        'vqfx': re.compile(r'^xe-0/0/\d+$'),
-        'server': re.compile(r'^em\d+$'),
-        # vScapa (vmm3 EVOvScapa): RAW EVOVPTX_CONNECT(IF_ET(0,0,<port>)).
-        # Junos exposes only the 8 ODD ports et-0/0/1,3,5,7,9,11,13,15
-        # (verified on a live vScapa). The shared IF_ET_X_0_<port> alias table
-        # runs 0-35, but any port outside that odd set is never bound inside
-        # Junos: VMM still builds the bridge and the vNIC, so the peer sees
-        # link-up while no traffic passes -> silently dead link.
-        'vscapa': re.compile(r'^et-0/0/(1|3|5|7|9|11|13|15)$'),
-        # vBrackla (vmm3): FPC1, RAW EVOVPTX_CONNECT(IF_ET(1,0,<port>)) -> et-1/0/<port>
-        # (no channel suffix on vmm3; the reference wires et-1/0/0). Only 5 data
-        # ports: its CSPP config (EVOvBRACKLA/COSIMPP/vbrackla_cspp.conf, named
-        # by BRACKLACHAN in common.brackla.defs) maps eth4..eth8 -> et-1/0/0..4.
-        'vbrackla': re.compile(r'^et-1/0/[0-4]$'),
-        # vFerrari: 5 fixed 100G ports on FPC0, not channelized. Emitted as
-        # VMX_CONNECT(ET(fpc,pic,port,0), ...) - same macro family as vmx.
-        'vferrari': re.compile(r'^et-0/0/[0-4]$'),
-        # vBugatti (vMX304 + LC304): 16 x 100G ports on FPC0, numbered 0-15.
-        # Verified on a live vBugatti, and the LC304_IF_ET_100G_X_0_<port>
-        # alias table is likewise 0-15. Emitted as
-        # LC304_CONNECT(LC304_IF_ET_100G(0,0,<port>), ...).
-        'vbugatti': re.compile(r'^et-0/0/([0-9]|1[0-5])$'),
-        # vHamilton (vMX10004 + vHamilton LCs): 14 ports per linecard, numbered
-        # from 0 (et-<fpc>/0/0 .. et-<fpc>/0/13), on up to 3 linecards FPC0-FPC2.
-        # Emitted as VHAMILTON_CONNECT(IF_ET(<fpc>,0,<port>), ...), one
-        # VHAMILTON_FPC block per FPC used (same shape as vAlfaRomeo).
-        'vhamilton': re.compile(r'^et-[0-2]/0/([0-9]|1[0-3])$'),
-        # vMaserati (vMX10004 + vMaserati LC, "XT"): TWO pics on one linecard -
-        # pic0 has 20 ports (et-<fpc>/0/0 .. et-<fpc>/0/19) and pic1 has 16
-        # (et-<fpc>/1/0 .. et-<fpc>/1/15). Unlike the EVO/CSPP platforms the full
-        # alias table really is wired: the shipped reference topology
-        # /vmm/data/user_disks/vmaserati/vmaserati-1router-mx10k4.config connects
-        # all 36 of them, so this range is the vendor's own list, not a guess.
-        # Alias mapping is VMASERATI_IF_ET_X_0_N -> vio<N+4> and
-        # VMASERATI_IF_ET_X_1_N -> vio<N+24> (vio, not eth).
-        # Emitted as VMASERATI_CONNECT(IF_ET(<fpc>,<pic>,<port>), ...) with the
-        # matching '#undef IF_ET_X_<pic>_<port>' - same PREFIXED handling as
-        # vHamilton/vAlfaRomeo.
-        'vmaserati': re.compile(r'^et-[0-2]/(0/([0-9]|1[0-9])|1/([0-9]|1[0-5]))$'),
-        # vBalerion (vmm3 EVO PTX): FPC0 linecard, ports et-0/0/9 .. et-0/0/26.
-        # Emitted as VBALERION_CONNECT(IF_ET(0,0,<port>), ...); the template also
-        # emits '#undef IF_ET_X_0_<port>' per port so the prefix-paste doesn't
-        # expand the unprefixed alias into junk (VBALERION_eth13).
-        'vbalerion': re.compile(r'^et-0/0/(9|1[0-9]|2[0-6])$'),
-        # vAlfaRomeo: 4 ports x 4 channelized subports per FPC, on FPC0, FPC1
-        # and FPC2 (up to 3 linecards). Emitted as
-        # VALFAROMEO_CONNECT(IF_ET_CHAN(fpc,pic,port,subport)), one
-        # VALFAROMEO_FPC block per FPC used.
-        'valfaromeo': re.compile(r'^et-[0-2]/0/[0-3]:[0-3]$'),
-        # vArdbeg (vmm3 EVO PTX): RAW connect - EVOVPTX_CONNECT(IF_ET(0,0,<port>)).
-        # The shared unprefixed IF_ET_X_0_<port> table runs to 35, but Junos
-        # only exposes et-0/0/0 .. et-0/0/11 (12 contiguous ports, verified on
-        # a live vArdbeg). Ports 12-35 exist as aliases only -> dead links.
-        'vardbeg': re.compile(r'^et-0/0/([0-9]|1[01])$'),
-        # vBowmore (vmm3 EVO PTX): PREFIXED connect - VBOWMORE_CONNECT pastes
-        # onto IF_ET_X_0_<port>. Same port layout as vScapa: Junos exposes only
-        # the 8 ODD ports et-0/0/1,3,...,15 (verified on a live vBowmore; its
-        # alias table is byte-identical to vScapa's). An even port yields a
-        # silently dead link - this is exactly what broke a real deployment.
-        'vbowmore': re.compile(r'^et-0/0/(1|3|5|7|9|11|13|15)$'),
-    }
+    interface_patterns = INTERFACE_PATTERNS
     vm_interfaces = defaultdict(list)
 
     # 2. Interface Naming Convention Check
@@ -463,13 +588,22 @@ def validate_topology(data):
                 else:
                     errors.append(f"Interface numbering for device '{hostname}' must start at index {start_index} and be sequential. Expected port indices {expected_sequence}, but found {numbers}.")
 
-    # Final error reporting
+    # Deduplicate and sort for stable output; the caller decides how to report.
+    return sorted(set(errors))
+
+
+def validate_topology(data):
+    """
+    CLI wrapper around collect_topology_errors(): prints the errors in the
+    familiar format and aborts. Behaviour is unchanged from before the split.
+    """
+    errors = collect_topology_errors(data)
     if errors:
         print("\n" + "="*60)
         print(" 🕵️‍♂️ YAML Topology Validation Failed")
         print("="*60)
         print("Please correct the following errors in your topology file:\n")
-        for error in sorted(list(set(errors))): # Use set to remove duplicate error messages
+        for error in errors:
             print(f"  - {error}")
         print("\nScript aborted.")
         sys.exit(1)
@@ -527,7 +661,8 @@ def add_sniffers_to_topology(data,quiet=False):
             
             capture_mappings.append({
                 "link": f"{ep1} <--> {ep2}",
-                "capture_point": f"{sniffer_vm_name} ({sniffer_iface1} <--> {sniffer_iface2})", "ifaces": [sniffer_iface1, sniffer_iface2]
+                "capture_point": f"{sniffer_vm_name} ({sniffer_iface1} <--> {sniffer_iface2})", "ifaces": [sniffer_iface1, sniffer_iface2],
+                "sniffer_vm": sniffer_vm_name
             })
             
             sniffer_iface_idx += 2
@@ -932,12 +1067,17 @@ def preflight_capacity_check(config_file, force=False):
           file=sys.stderr)
 
 
-def verify_lab_running(config_file):
+def verify_lab_running(config_file, settle_timeout=180, poll_interval=5):
     """
     Confirm the lab actually materialised. 'vmm start' can exit 0 while nothing
     was bound (e.g. an orphaned lab still holds the capacity), which used to be
     reported as success and then wasted the whole boot wait followed by an
     endless serial-console retry loop against VMs that do not exist.
+
+    'vmm start' also returns *before* VMM has finished registering the VMs, so a
+    single 'vmm ls' right after it reports a lab that is coming up fine as
+    completely absent. Poll until every expected VM has appeared, and only call
+    it a failure once settle_timeout has passed with some still missing.
 
     Returns a list of problem strings (empty when the lab is really up).
     """
@@ -949,18 +1089,32 @@ def verify_lab_running(config_file):
     else:
         expected = set(re.findall(r'vm\s+"([^"]+)"\s*\{', expanded))
 
-    rc, out = _run_vmm(["ls"], timeout=180)
+    deadline = time.time() + settle_timeout
+    announced = False
+    while True:
+        rc, out = _run_vmm(["ls"], timeout=180)
+        if rc != 0:
+            return [f"'vmm ls' failed (exit {rc})"]
+
+        listed = {line.split("\t")[0].strip() for line in out.splitlines() if line.strip()}
+        missing = sorted(n for n in expected if n not in listed)
+        if not missing or time.time() >= deadline:
+            break
+        if not announced:
+            print(f"   waiting for VMM to register {len(missing)}/{len(expected)} "
+                  f"VMs (up to {settle_timeout}s)...")
+            announced = True
+        time.sleep(poll_interval)
+
     problems = []
-    if rc != 0:
-        return [f"'vmm ls' failed (exit {rc})"]
     if "No config active" in out:
         problems.append("VMM reports 'No config active' - the config never took effect")
-
-    listed = {line.split("\t")[0].strip() for line in out.splitlines() if line.strip()}
-    missing = sorted(n for n in expected if n not in listed)
     if missing:
         shown = ", ".join(missing[:6]) + ("..." if len(missing) > 6 else "")
-        problems.append(f"{len(missing)}/{len(expected)} configured VMs are absent: {shown}")
+        problems.append(f"{len(missing)}/{len(expected)} configured VMs are absent "
+                        f"after {settle_timeout}s: {shown}")
+    elif announced:
+        print(f"   all {len(expected)} VMs registered.")
 
     orphans = [l.split("VM", 1)[-1].split("on server")[0].strip()
                for l in out.splitlines() if "not in current config" in l]
@@ -1795,89 +1949,175 @@ def configure_vbrackla_serial(name, interfaces, debug=False, retries=15, delay=1
         return f"Failure: {name} ({e})"
 
 
-def upload_sniffer_script(capture_mappings):
+def _find_bridge_script():
+    """Locate br.sh - the explicit override first, then the shared scripts
+    directory, then a copy sitting next to vmm.py so a fresh checkout on a
+    machine without /homes/... still configures its sniffer."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for path in (SNIFFER_BRIDGE_SCRIPT, os.path.join(here, "br.sh")):
+        if path and os.path.isfile(path):
+            return path
+    return None
+
+
+def _connect_sniffer(ip, attempts=10, delay=10):
+    """SSH to the sniffer, waiting for sshd. The sniffer is a Linux VM and is
+    deliberately not part of the Phase 3 boot gate, so it is routinely still
+    booting when we get here - one attempt is not enough."""
+    last_error = None
+    for n in range(1, attempts + 1):
+        try:
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            ssh.connect(ip, username=DEVICE_ROOT_USER,
+                        password=DEVICE_ROOT_PASSWORD, timeout=15,
+                        banner_timeout=25, auth_timeout=25)
+            return ssh, None
+        except Exception as exc:                       # noqa: BLE001
+            last_error = exc
+            if n < attempts:
+                print(f"   ...sniffer SSH not ready yet ({type(exc).__name__}); "
+                      f"retrying in {delay}s [{n}/{attempts - 1}]")
+                time.sleep(delay)
+    return None, last_error
+
+
+def _ssh_run(ssh, command, timeout=300):
+    """Run a command over SSH and return (exit_code, combined_output)."""
+    _, stdout, stderr = ssh.exec_command(command, timeout=timeout)
+    out = stdout.read().decode(errors="replace")
+    err = stderr.read().decode(errors="replace")
+    return stdout.channel.recv_exit_status(), (out + err).strip()
+
+
+def configure_sniffer_bridges(capture_mappings):
+    """Bridge each sniffed link's interface pair on the sniffer VM.
+
+    A sniffer sits *inside* the link - A --- eth1 [sniffer] eth2 --- B - so
+    until those two interfaces are bridged the link is simply cut in half and
+    passes no traffic at all. This uploads br.sh and runs it once per sniffed
+    link to build a transparent bridge, which is what makes the link work.
     """
-    Finds the sniffer VM's IP, uploads the bridging script, and executes it
-    for each sniffed link to create the necessary bridges.
-    """
+    sniffed = [m for m in capture_mappings if m.get("ifaces")]
+    if not sniffed:
+        return True                       # no sniffed links; nothing to say
+
+    print("\n" + "=" * 50)
+    print(" 🕵️  Phase 3.5: Bridging the Capture VM")
+    print("=" * 50)
+    print("A sniffer sits inside the link, so its two interfaces must be "
+          "bridged\nor the link passes no traffic.\n")
+
     if not paramiko:
-        return "⚠️  Skipping sniffer configuration: 'paramiko' library is not installed."
+        print("❌ 'paramiko' is not installed, so the sniffer cannot be "
+              "configured.\n   Run: pip3 install paramiko")
+        return False
 
-    # Filter for only the mappings that have sniffer interfaces defined
-    sniffed_links = [m for m in capture_mappings if 'ifaces' in m and m['ifaces']]
-    if not sniffed_links:
-        logging.info("No links marked for sniffing. Skipping sniffer configuration.")
-        return "✅ No sniffed links to configure."
+    script = _find_bridge_script()
+    if not script:
+        print(f"❌ Bridging script not found. Looked for:\n"
+              f"     {SNIFFER_BRIDGE_SCRIPT}\n"
+              f"     {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'br.sh')}\n"
+              f"   Point VMM_SNIFFER_SCRIPT at your br.sh, or drop a copy "
+              f"beside vmm.py.")
+        return False
 
-    logging.info("🚀 Locating and configuring sniffer VM via SSH...")
-    
-    # --- Step 1 & 2: Get Sniffer IP ---
-    result = subprocess.run(["vmm", "ping"], capture_output=True, text=True, check=False)
-    sniffer_ip = None
-    if result.stdout:
-        for line in result.stdout.splitlines():
-            if "Sniffer" in line and "alive" in line:
-                match = re.search(r'(\d+\.\d+\.\d+\.\d+)', line)
-                if match:
-                    sniffer_ip = match.group(1)
-                    logging.info(f"✅ Sniffer VM found at IP: {sniffer_ip}")
-                    break
-    
-    # --- Step 3: If sniffer IP wasn't found, fail with a clear error ---
-    if not sniffer_ip:
-        error_message = "❌ Failed to find an 'alive' Sniffer VM from 'vmm ping' output."
-        logging.error(error_message)
-        if result.stderr:
-            logging.error(f"   'vmm ping' error: {result.stderr.strip()}")
-        return f"Failure: {error_message}"
+    host = sniffed[0].get("sniffer_vm") or "sniffer1"
 
-    # --- Step 4: Proceed with SSH, now that we have a valid IP ---
-    local_script_path = SNIFFER_BRIDGE_SCRIPT
-    remote_script_path = "/root/br.sh"
+    # The sniffer is a Linux VM, so 'vmm ping' lists it under its plain
+    # hostname - no _RE/-re0 suffix.
+    ip = get_vmm_ip_map().get(host)
+    if not ip:
+        state = get_vmm_ping_map().get(host)
+        print(f"❌ Could not find an IP for the capture VM '{host}'.")
+        print(f"   'vmm ping' says: {state or 'it is not listed at all'}.")
+        print("   If it is Unbound, bind it and re-run with --resume.")
+        return False
+    print(f"Capture VM '{host}' is at {ip}. Uploading {os.path.basename(script)}...")
 
-    if not os.path.exists(local_script_path):
-        return f"❌ Error: Sniffer script not found at {local_script_path}"
+    ssh, error = _connect_sniffer(ip)
+    if not ssh:
+        print(f"❌ Could not SSH to {host} at {ip}: {error}")
+        return False
 
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(sniffer_ip, username=DEVICE_ROOT_USER, password=DEVICE_ROOT_PASSWORD, timeout=20)
-        
+        # Ask the VM which interfaces it actually has rather than trusting the
+        # topology - a half-attached link shows up here and nowhere else.
+        rc, out = _ssh_run(ssh, "ls /sys/class/net", timeout=30)
+        present = set(out.split()) if rc == 0 else set()
+
+        remote = "/root/br.sh"
         sftp = ssh.open_sftp()
-        sftp.put(local_script_path, remote_script_path)
+        sftp.put(script, remote)
         sftp.close()
-        
-        # Make script executable
-        stdin, stdout, stderr = ssh.exec_command(f"chmod +x {remote_script_path}")
-        if stdout.channel.recv_exit_status() != 0:
-            ssh.close()
-            return f"❌ Failed to make sniffer script executable. Error: {stderr.read().decode().strip()}"
-        
-        # Loop through sniffed links and create a bridge for each
-        bridge_idx = 1
-        bridge_errors = []
-        for link_info in sniffed_links:
-            iface1, iface2 = link_info['ifaces']
-            bridge_name = f"br{bridge_idx}"
-            command = f"{remote_script_path} {bridge_name} {iface1} {iface2}"
-            logging.info(f"   - Executing on sniffer: '{command}'")
-            
-            stdin, stdout, stderr = ssh.exec_command(command)
-            if stdout.channel.recv_exit_status() != 0:
-                error_output = stderr.read().decode().strip()
-                bridge_errors.append(f"   - Failed on bridge {bridge_name}: {error_output}")
-            bridge_idx += 1
-        
+        _ssh_run(ssh, f"chmod +x {remote}", timeout=30)
+
+        ok, failed = [], []
+        for idx, mapping in enumerate(sniffed, start=1):
+            if1, if2 = mapping["ifaces"]
+            bridge = f"br{idx}"
+            label = mapping.get("link", f"{if1} <--> {if2}")
+
+            missing = [i for i in (if1, if2) if present and i not in present]
+            if missing:
+                print(f"  ✗ {bridge}: {', '.join(missing)} missing on {host} "
+                      f"(it has: {' '.join(sorted(present)) or 'nothing'})")
+                failed.append(f"{bridge} ({label}): interface(s) "
+                              f"{', '.join(missing)} do not exist")
+                continue
+
+            # br.sh is idempotent: an existing bridge keeps its netplan config
+            # and only has the transparency settings re-applied. Always running
+            # it means a lab bridged by an older version gets fixed too.
+            rc, members = _ssh_run(ssh, f"ls /sys/class/net/{bridge}/brif 2>/dev/null",
+                                   timeout=30)
+            existed = rc == 0 and {if1, if2} == set(members.split())
+            if existed:
+                print(f"  = {bridge}: {if1} <-> {if2} already bridged, re-applying transparency")
+            else:
+                print(f"  → {bridge}: bridging {if1} <-> {if2}  ({label})")
+            rc, out = _ssh_run(ssh, f"{remote} {bridge} {if1} {if2}", timeout=420)
+            if rc != 0:
+                detail = out.splitlines()[-1] if out else f"exit code {rc}"
+                print(f"  ✗ {bridge}: {detail}")
+                failed.append(f"{bridge} ({label}): {detail}")
+                continue
+
+            # Trust nothing: confirm the bridge exists with both members in it.
+            rc, members = _ssh_run(ssh, f"ls /sys/class/net/{bridge}/brif 2>/dev/null",
+                                   timeout=30)
+            if rc == 0 and {if1, if2} <= set(members.split()):
+                # Prove the link-local group addresses really are forwarded -
+                # a bridge with a zero mask silently eats LLDP and LACP.
+                _, mask = _ssh_run(ssh,
+                    f"cat /sys/class/net/{if1}/brport/group_fwd_mask", timeout=30)
+                transparent = mask.strip() not in ("", "0x0", "0")
+                note = "" if transparent else "  ⚠️  link-local frames NOT forwarded"
+                print(f"  ✓ {bridge}: up, carrying {if1} and {if2}{note}")
+                ok.append(bridge)
+            else:
+                print(f"  ✗ {bridge}: script succeeded but the bridge has no members")
+                failed.append(f"{bridge} ({label}): built but empty")
+    finally:
         ssh.close()
 
-        if not bridge_errors:
-            return f"✅ Successfully configured {bridge_idx - 1} sniffer bridge(s) on {sniffer_ip}"
-        else:
-            return f"❌ Failed to configure some sniffer bridges:\n" + "\n".join(bridge_errors)
+    print()
+    if failed and not ok:
+        print(f"❌ No capture bridges were created on {host}. "
+              f"Sniffed links will not pass traffic.")
+    elif failed:
+        print(f"⚠️  {len(ok)} of {len(sniffed)} capture bridges are up on {host}; "
+              f"the rest failed:")
+    else:
+        print(f"✅ {len(ok)} capture bridge(s) up on {host} - sniffed links pass "
+              f"traffic again.")
+        print(f"   Capture with:  ssh {DEVICE_ROOT_USER}@{ip}  then  "
+              f"tcpdump -i {sniffed[0]['ifaces'][0]} -w /tmp/capture.pcap")
+    for line in failed:
+        print(f"   - {line}")
+    return not failed
 
-    except Exception as e:
-        logging.error(f"❌ An SSH or Paramiko error occurred: {e}", exc_info=True)
-        return f"Failure: Could not configure sniffer due to SSH error ({e})"
+
 # -----------------------------
 # Print Summary Table
 # -----------------------------
@@ -2948,6 +3188,10 @@ def main():
     parser.add_argument("--config", action="store_true", help="Enter configuration management mode.")
     parser.add_argument("--config_file_only", action="store_true", help="Generate the VMM config file only and exit.")
     parser.add_argument("--force", action="store_true", help="Deploy even if the lab looks too big for the pod's free capacity.")
+    parser.add_argument("--resume", action="store_true",
+                        help="The lab is already deployed and running: skip Phase 2 "
+                             "(unbind/config/start) and go straight to waiting for boot "
+                             "and applying the baseline configuration.")
     parser.add_argument("--skip_boot_wait", action="store_true",
                         help="Skip the Phase 3 ping wait entirely and go straight to configuration. "
                              "Safe because devices are configured over the serial console, which "
@@ -2987,7 +3231,23 @@ def main():
                         help="Stop the background topology web server.")
     parser.add_argument("--port", type=int, default=8080, metavar="PORT",
                         help="Port for --serve (default 8080).")
+    parser.add_argument("--build", action="store_true",
+                        help="Start the browser-based topology BUILDER: pick devices, wire them "
+                             "port-to-port by clicking, validate live against the same rules this "
+                             "script enforces, then save topo.yml or deploy. Runs in the foreground.")
+    parser.add_argument("--build-port", dest="build_port", type=int, default=8081, metavar="PORT",
+                        help="Port for --build (default 8081, so it can run alongside --serve).")
     args = parser.parse_args()
+
+    # --- Topology builder UI (foreground; writes args.topology) ---
+    if args.build:
+        try:
+            import vmm_builder
+        except ImportError as e:
+            print(f"❌ Could not load the builder UI: {e}\n"
+                  f"   vmm_builder.py must sit next to vmm.py.", file=sys.stderr)
+            sys.exit(1)
+        sys.exit(vmm_builder.serve_builder(args.topology, args.build_port))
 
     # --- Web server: decoupled from deploy, runs in the background ---
     if args.serve_stop:
@@ -3040,7 +3300,11 @@ def main():
 
     # --- Normal execution flow ---
     topology_data, final_summary_mappings, capture_mappings = generate_config(args.topology, args.output)
-    run_vmm_config(args.output, force=args.force)
+    if args.resume:
+        print("\n⏭️  --resume: the lab is already deployed, skipping Phase 2 "
+              "(unbind/config/start) and going straight to the boot wait.")
+    else:
+        run_vmm_config(args.output, force=args.force)
     
     if args.skip_boot_wait:
         print("\n⏭️  Skipping the boot wait (--skip_boot_wait); serial consoles "
@@ -3051,7 +3315,7 @@ def main():
 
 
     time.sleep(5)
-    result = upload_sniffer_script(capture_mappings)
+    configure_sniffer_bridges(capture_mappings)
     print("\n" + "="*50)
     print(" 🔧 Phase 4: Applying Baseline Configuration")
     print("="*50) 
