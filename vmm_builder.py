@@ -23,9 +23,11 @@ The only thing the browser knows about ports is the list the server handed it
 from PORT_CATALOG, which is itself checked against INTERFACE_PATTERNS at import.
 """
 
+import errno
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -55,8 +57,6 @@ DEFAULT_DISKS = {
     'vbalerion':  ('vbalerion_disk',  '/vmm/data/base_disks/default_images/default_image_vbalerion.img'),
     'vbowmore':   ('vbowmore_disk',   '/vmm/data/base_disks/default_images/default_image_vbowmore.img'),
 }
-
-SNIFFER_DISK = ('sniffer_disk', '/vmm/data/base_disks/ubuntu/ubuntu-22.04.qcow2')
 
 # Short per-type note shown in the palette. Facts only - anything surprising
 # here was learned the hard way on a live device.
@@ -130,31 +130,12 @@ def topology_from_payload(payload):
         vms.append(vm)
 
     out_links = []
-    wants_sniffer = False
     for l in links:
         a, b = l.get('a'), l.get('b')
         if not a or not b:
             continue
-        entry = {'endpoints': [f"{a['host']}:{a['port']}", f"{b['host']}:{b['port']}"]}
-        if l.get('sniffer'):
-            entry['sniffer'] = True
-            wants_sniffer = True
-        out_links.append(entry)
-
-    # A 'sniffer: true' link needs BOTH the sniffer_disk alias and an actual VM
-    # using it - add_sniffers_to_topology() looks up the VM by disk alias and
-    # silently does nothing if it is missing ("no VM using 'sniffer_disk' was
-    # found ... No sniffers will be added"). The checkbox would appear to work
-    # while capturing nothing, so materialise the VM here.
-    if wants_sniffer:
-        disks[SNIFFER_DISK[0]] = SNIFFER_DISK[1]
-        if not any(v['disk'] == SNIFFER_DISK[0] for v in vms):
-            taken = {v['hostname'] for v in vms}
-            vms.append({
-                'hostname': _default_hostname('sniffer', taken),
-                'type': 'server',
-                'disk': SNIFFER_DISK[0],
-            })
+        out_links.append(
+            {'endpoints': [f"{a['host']}:{a['port']}", f"{b['host']}:{b['port']}"]})
 
     return {
         'lab_name': (payload.get('labName') or '').strip(),
@@ -204,8 +185,6 @@ def topology_to_yaml(payload):
         for l in data['links']:
             ep = ', '.join('"%s"' % e for e in l['endpoints'])
             L.append(f"  - endpoints: [{ep}]")
-            if l.get('sniffer'):
-                L.append("    sniffer: true")
     else:
         L.append("links: []")
     L.append("")
@@ -467,6 +446,245 @@ def _json_response(handler, obj, code=200):
     handler.wfile.write(body)
 
 
+# =============================================================================
+#  Capture sessions
+# =============================================================================
+_CAP_LOCK = threading.Lock()
+_CAPTURES = {}
+_CAP_PENDING = set()
+
+# A capture writes into /vmm/logs as root on a filesystem the whole pod shares,
+# and QEMU keeps dumping long after the browser that asked for it has gone. A
+# closed tab must not leave a file growing for hours, so every capture is on a
+# leash: it stops when nobody is watching, when it has run long enough, or when
+# the file gets big.
+_CAP_IDLE_STOP = 120              # seconds without a browser poll
+_CAP_MAX_SECONDS = 20 * 60
+_CAP_MAX_BYTES = 250 * 1024 * 1024
+_CAP_WATCHDOG = None
+
+
+class _Capture:
+    """One running capture, owned by the builder process.
+
+    The actual dump lives inside the VM's QEMU process, so it survives a browser
+    refresh; this object only tracks what has already been shown.
+    """
+
+    def __init__(self, cid, vm, netdev, peer, label):
+        self.id = cid
+        self.vm = vm
+        self.netdev = netdev
+        self.peer = peer
+        self.label = label
+        self.dir = vmm.capture_dir(vm)
+        self.path = vmm.capture_start(vm, netdev)
+        # Arm the live preview now rather than on the first poll: someone who
+        # starts a capture and immediately sends traffic would otherwise have
+        # nothing watching for it until a few seconds later.
+        _, self.preview_idx = vmm.preview_rotate(vm, netdev, self.dir, 0)
+        self.total = 0
+        self.running = True
+        self.started = time.time()
+        self.last_poll = time.time()
+        self.stop_reason = ''
+        self.lock = threading.Lock()
+
+    def poll(self):
+        """Advance the live packet counter.
+
+        The preview dump is still rotated, because that is the only way to have
+        a running total at all: QEMU buffers the continuous capture and flushes
+        it when it is closed, so its file size says nothing while it records.
+        The summaries themselves are counted and dropped - the panel reports how
+        many packets crossed the link, not what they were.
+        """
+        with self.lock:
+            self.last_poll = time.time()
+            if not self.running:
+                return 0
+            fresh, self.preview_idx = vmm.preview_rotate(
+                self.vm, self.netdev, self.dir, self.preview_idx)
+            self.total += len(fresh)
+            return len(fresh)
+
+    def size(self):
+        try:
+            vmm._nfs_revalidate(self.path)
+            return os.path.getsize(self.path)
+        except OSError:
+            return 0
+
+    def stop(self, reason=''):
+        """Flush and close the capture. Safe to call twice."""
+        with self.lock:
+            if not self.running:
+                return
+            self.running = False
+            self.stop_reason = reason
+            vmm.preview_stop(self.vm, self.netdev, self.dir, self.preview_idx)
+            vmm.capture_stop(self.vm, self.netdev)
+            time.sleep(0.6)  # let QEMU's flush reach the shared filesystem
+
+    def info(self):
+        return {'id': self.id, 'vm': self.vm, 'netdev': self.netdev,
+                'peer': self.peer, 'label': self.label, 'running': self.running,
+                'total': self.total, 'bytes': self.size(),
+                'file': self.path, 'name': os.path.basename(self.path),
+                'stopReason': self.stop_reason,
+                'seconds': int(time.time() - self.started)}
+
+
+def _capture_watchdog():
+    """Stop captures nobody is watching any more.
+
+    Without this a closed browser tab leaves QEMU dumping to the shared
+    filesystem indefinitely - which is exactly what a 'quick look at a link'
+    should never do.
+    """
+    while True:
+        time.sleep(15)
+        now = time.time()
+        for cap in list(_CAPTURES.values()):
+            if not cap.running:
+                continue
+            reason = ''
+            if now - cap.last_poll > _CAP_IDLE_STOP:
+                reason = ('stopped automatically - the page stopped polling '
+                          f'for {_CAP_IDLE_STOP}s (tab closed?)')
+            elif now - cap.started > _CAP_MAX_SECONDS:
+                reason = ('stopped automatically after '
+                          f'{_CAP_MAX_SECONDS // 60} minutes')
+            elif cap.size() > _CAP_MAX_BYTES:
+                reason = ('stopped automatically at '
+                          f'{_CAP_MAX_BYTES // (1024 * 1024)} MB')
+            if reason:
+                try:
+                    cap.stop(reason)
+                except Exception:
+                    pass
+
+
+def _ensure_watchdog():
+    global _CAP_WATCHDOG
+    if _CAP_WATCHDOG is None:
+        _CAP_WATCHDOG = threading.Thread(
+            target=_capture_watchdog, name='capture-watchdog', daemon=True)
+        _CAP_WATCHDOG.start()
+
+
+def capture_start_api(payload):
+    """Begin capturing the link the browser right-clicked."""
+    a, b = payload.get('a') or {}, payload.get('b') or {}
+    host_a, host_b = a.get('host'), b.get('host')
+    if not host_a or not host_b:
+        return {'ok': False, 'error': 'That link has no two endpoints.'}
+
+    cid = f"{host_a}|{a.get('port','')}|{host_b}|{b.get('port','')}"
+    with _CAP_LOCK:
+        existing = _CAPTURES.get(cid)
+        if existing and existing.running:
+            return {'ok': True, 'already': True, **existing.info()}
+        # Attaching the dump takes a few seconds of monitor chatter. Claim the
+        # link inside the lock so an impatient second click cannot start a
+        # parallel dump and orphan the first file.
+        if cid in _CAP_PENDING:
+            return {'ok': False, 'error':
+                    'That link is already starting - give it a few seconds.'}
+        _CAP_PENDING.add(cid)
+
+    try:
+        return _capture_begin(cid, payload, host_a, host_b, a, b)
+    finally:
+        with _CAP_LOCK:
+            _CAP_PENDING.discard(cid)
+
+
+def _capture_begin(cid, payload, host_a, host_b, a, b):
+    try:
+        if not vmm.running_vms():
+            return {'ok': False, 'error':
+                    'No VMs are running - deploy the lab before capturing.'}
+        # The interface names are what make this exact when the two devices are
+        # wired together more than once.
+        targets = vmm.resolve_capture(host_a, host_b,
+                                      port_a=a.get('port'), port_b=b.get('port'))
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+    if not targets:
+        return {'ok': False, 'error':
+                f"{host_a} {a.get('port','')} and {host_b} {b.get('port','')} "
+                f"are not wired together in the running lab. Deploy the "
+                f"current topology first."}
+
+    chosen = targets[0]
+    if len(targets) > 1 and payload.get('netdev'):
+        chosen = next((t for t in targets if t['netdev'] == payload['netdev']),
+                      targets[0])
+
+    label = f"{host_a} {a.get('port','')} <-> {host_b} {b.get('port','')}".strip()
+    try:
+        cap = _Capture(cid, chosen['vm'], chosen['netdev'], chosen['peer'], label)
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+
+    with _CAP_LOCK:
+        _CAPTURES[cid] = cap
+    _ensure_watchdog()
+    out = {'ok': True, **cap.info()}
+    if len(targets) > 1:
+        # Only reachable when the interface could not be resolved to one wire,
+        # so say which one is being recorded rather than pretending it is the
+        # one that was asked for.
+        out['note'] = (f"{host_a} and {host_b} have {len(targets)} links and the "
+                       f"interface could not be matched to one; capturing "
+                       f"{chosen['netdev']}.")
+        out['choices'] = targets
+    return out
+
+
+def capture_poll_api(cid):
+    cap = _CAPTURES.get(cid)
+    if not cap:
+        return {'ok': False, 'error': 'No such capture.'}
+    try:
+        cap.poll()
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+    return {'ok': True, **cap.info()}
+
+
+def capture_stop_api(cid):
+    cap = _CAPTURES.get(cid)
+    if not cap:
+        return {'ok': False, 'error': 'No such capture.'}
+    try:
+        cap.stop()
+    except Exception as exc:
+        return {'ok': False, 'error': str(exc)}
+    return {'ok': True, **cap.info()}
+
+
+def capture_list_api():
+    return {'ok': True, 'captures': [c.info() for c in _CAPTURES.values()]}
+
+
+def capture_stop_all():
+    """Leave no dumps attached when the builder exits."""
+    for cap in list(_CAPTURES.values()):
+        try:
+            cap.stop('builder stopped')
+        except Exception:
+            pass
+
+
+def _query(handler, key):
+    """One query-string value, or ''. Enough for the ids we pass around."""
+    from urllib.parse import parse_qs, urlparse
+    return (parse_qs(urlparse(handler.path).query).get(key) or [''])[0]
+
+
 def _read_json(handler):
     n = int(handler.headers.get('Content-Length') or 0)
     if not n:
@@ -516,6 +734,34 @@ def make_handler(topo_path):
                     return _json_response(self, {'ok': True, 'topology': data})
                 except Exception as e:
                     return _json_response(self, {'ok': False, 'error': str(e)})
+            if path == '/api/capture/list':
+                return _json_response(self, capture_list_api())
+            if path == '/api/capture/poll':
+                return _json_response(self, capture_poll_api(_query(self, 'id')))
+            if path == '/api/capture/download':
+                cap = _CAPTURES.get(_query(self, 'id'))
+                if not cap:
+                    self.send_error(404)
+                    return
+                # The file is only complete once QEMU has flushed it, so a
+                # download implicitly ends the capture rather than handing over
+                # a truncated trace.
+                cap.stop()
+                try:
+                    vmm._nfs_revalidate(cap.path)
+                    with open(cap.path, 'rb') as fh:
+                        blob = fh.read()
+                except OSError as exc:
+                    self.send_error(500, str(exc))
+                    return
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/vnd.tcpdump.pcap')
+                self.send_header('Content-Disposition',
+                                 f'attachment; filename="{os.path.basename(cap.path)}"')
+                self.send_header('Content-Length', str(len(blob)))
+                self.end_headers()
+                self.wfile.write(blob)
+                return
             self.send_error(404)
 
         def do_POST(self):
@@ -571,6 +817,12 @@ def make_handler(topo_path):
                 return _json_response(self, {'ok': ok, 'message': msg,
                                              'path': os.path.abspath(topo_path)})
 
+            if path == '/api/capture/start':
+                return _json_response(self, capture_start_api(payload))
+
+            if path == '/api/capture/stop':
+                return _json_response(self, capture_stop_api(payload.get('id')))
+
             if path == '/api/deploy/stop':
                 return _json_response(self, {'ok': DEPLOY.stop()})
 
@@ -582,15 +834,87 @@ def make_handler(topo_path):
     return Handler
 
 
+# -----------------------------
+# Clean shutdown on a kill signal
+# -----------------------------
+# Ctrl+C already exits cleanly, because KeyboardInterrupt unwinds through
+# serve_builder()'s 'finally' and detaches every capture. A signal does not, and
+# that difference is expensive here: the dump lives inside the VM's QEMU process
+# and outlives the builder, while the watchdog that would have reaped it is a
+# thread *in* the builder. Killed abruptly, a capture is left writing to a
+# filesystem the whole pod shares with nothing anywhere left to stop it - not
+# after 20 minutes, not at 250 MB, not ever.
+#
+# Both signals are ordinary events, not hypotheticals:
+#   SIGHUP  - the builder runs in the foreground, so a dropped ssh session or a
+#             closed laptop sends one (the startup banner above says as much).
+#   SIGTERM - what 'vmm.py --stop-port' sends, and what reclaim_port() sends by
+#             itself when a new builder takes the port from an old one.
+#
+# Raising KeyboardInterrupt is deliberate: it reuses the exact shutdown path
+# Ctrl+C already takes, so there is one cleanup route rather than two. It cannot
+# deadlock the way srv.shutdown() would - that blocks until serve_forever()
+# returns, and the handler runs on the very thread that is sitting inside it.
+def _stop_on_signal(signum, _frame):
+    name = signal.Signals(signum).name if hasattr(signal, "Signals") else signum
+    print(f"\n({name} received)", flush=True)
+    raise KeyboardInterrupt
+
+
+def _install_shutdown_signals():
+    """Route SIGTERM/SIGHUP into the same clean exit as Ctrl+C.
+
+    An inherited SIG_IGN is left alone. That matters for SIGHUP specifically:
+
+        nohup python3 vmm.py --build --port 5057 > builder.log 2>&1 &
+
+    is the documented way to keep the builder alive across a dropped ssh
+    session, and nohup implements it by ignoring SIGHUP. Installing a handler
+    unconditionally would take that back and kill the builder on exactly the
+    event the user went out of their way to survive - trading a leaked capture
+    for a dead server, which is a worse deal.
+
+    Best effort otherwise: handlers can only be installed from the main thread,
+    and serve_builder() is called straight from vmm.py's main(), so that holds.
+    If it is ever called off-thread the error is swallowed and the server still
+    serves - it just loses the tidy shutdown, which is where it was before.
+    """
+    for signame in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, signame, None)   # SIGHUP does not exist on Windows
+        if sig is None:
+            continue
+        try:
+            if signal.getsignal(sig) is signal.SIG_IGN:
+                continue
+            signal.signal(sig, _stop_on_signal)
+        except (ValueError, OSError):
+            pass
+
+
 def serve_builder(topo_path="topo.yml", port=8081):
     """Start the builder UI. Blocks until Ctrl+C."""
     handler = make_handler(topo_path)
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", port), handler)
     except OSError as e:
-        print(f"❌ Could not start the builder on port {port}: {e}\n"
-              f"   Try a different port with --port <N>.", file=sys.stderr)
-        return 1
+        # Almost always our own orphan: a builder whose ssh session dropped, or
+        # one left behind in a closed tab. Take the port back and carry on, so
+        # resuming a lab on the same port stays a single command.
+        srv = None
+        if getattr(e, "errno", None) == errno.EADDRINUSE and vmm.reclaim_port(port):
+            try:
+                srv = ThreadingHTTPServer(("0.0.0.0", port), handler)
+            except OSError as e2:
+                e = e2
+        if srv is None:
+            print(f"❌ Could not start the builder on port {port}: {e}", file=sys.stderr)
+            if getattr(e, "errno", None) == errno.EADDRINUSE:
+                print(vmm.describe_port_conflict(port), file=sys.stderr)
+                print(f"   Or run the builder elsewhere:  --build --port {port + 1}",
+                      file=sys.stderr)
+            else:
+                print(f"   Try a different port with --port <N>.", file=sys.stderr)
+            return 1
 
     try:
         ip = vmm.qpod_ip()
@@ -609,11 +933,28 @@ def serve_builder(topo_path="topo.yml", port=8081):
         print("  Deploy    : DISABLED — no 'vmm' command here. You can still design")
         print("              and save the file, then deploy from a -vmm pod host.")
     print("  Rules     : validated by vmm.py itself, live as you wire.")
-    print("  Ctrl+C to stop.\n", flush=True)   # flush: stdout block-buffers under nohup/redirect
+    print("  Ctrl+C to stop.", flush=True)
+    if sys.stdout.isatty():
+        # This server runs in the foreground, so it dies with the shell that
+        # started it. On a pod that means a dropped ssh session (or a closed
+        # laptop) silently takes the page down, which looks like "the port
+        # stopped working" rather than "my server exited".
+        print(f"  Note: it stops when this shell does. To survive an ssh drop, run:")
+        print(f"        nohup python3 vmm.py --build --port {port} > builder.log 2>&1 &")
+        print(f"        ...and later free the port with: python3 vmm.py --stop-port {port}")
+    print("", flush=True)
+    _install_shutdown_signals()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         print("\n👋 builder stopped.")
+    finally:
+        # QEMU keeps dumping to the shared filesystem until the object is
+        # removed, so exiting must not leave one attached.
+        running = [c for c in _CAPTURES.values() if c.running]
+        if running:
+            print(f"   closing {len(running)} running capture(s)…", flush=True)
+        capture_stop_all()
     return 0
 
 
@@ -650,6 +991,15 @@ BUILDER_HTML = r"""<!DOCTYPE html>
 
   #app{display:grid;grid-template-columns:212px 1fr var(--rw,330px);
     grid-template-rows:48px 1fr;height:100vh;position:relative}
+  /* Collapsing a panel keeps --rw intact, so unhiding restores the width you
+     had dragged it to rather than snapping back to the default. */
+  #app.no-left{grid-template-columns:0 1fr var(--rw,330px)}
+  #app.no-right{grid-template-columns:212px 1fr 0}
+  #app.no-left.no-right{grid-template-columns:0 1fr 0}
+  #app.no-left aside.left{display:none}
+  #app.no-right aside.right, #app.no-right #rsz{display:none}
+  .pin{padding:4px 7px;font-size:12px;line-height:1}
+  .pin.off{color:var(--dim);background:transparent}
   header{grid-column:1/4;display:flex;align-items:center;gap:12px;padding:0 14px;
     background:var(--panel);border-bottom:1px solid var(--line)}
   header h1{font-size:14px;margin:0;font-weight:600;letter-spacing:.3px}
@@ -658,6 +1008,11 @@ BUILDER_HTML = r"""<!DOCTYPE html>
   .badge.ok{color:var(--ok)} .badge.err{color:var(--err)}
 
   aside{background:var(--panel);border-right:1px solid var(--line);overflow-y:auto}
+  /* Explicit columns: hiding a panel with display:none takes it out of grid
+     auto-placement, and main would otherwise slide into the collapsed column
+     and vanish along with it. */
+  aside.left{grid-column:1}
+  main{grid-column:2}
   aside.right{border-right:none;border-left:1px solid var(--line);grid-column:3}
   .sect{padding:9px 12px;font-size:10px;letter-spacing:.9px;text-transform:uppercase;
     color:var(--dim);border-bottom:1px solid var(--line);position:sticky;top:0;background:var(--panel);z-index:2}
@@ -678,9 +1033,57 @@ BUILDER_HTML = r"""<!DOCTYPE html>
   .node{cursor:grab}
   .lnk{stroke-width:2;cursor:pointer}
   .lnk.sel{stroke:var(--accent) !important;stroke-width:3}
+  /* A link being captured is drawn as a travelling dashed red line, so it is
+     obvious at a glance which one is recording - the tab may not be open. */
+  .lnk.rec{stroke:#ff5c5c !important;stroke-width:3;stroke-dasharray:7 5;
+           animation:recflow 1s linear infinite}
+  @keyframes recflow{to{stroke-dashoffset:-12}}
   .lhit{stroke:transparent;stroke-width:14;fill:none;cursor:pointer}
+  /* Right-click menu for links. */
+  #lmenu{position:fixed;z-index:60;display:none;min-width:190px;padding:4px;
+         background:#141c26;border:1px solid #2b3a4d;border-radius:8px;
+         box-shadow:0 10px 30px rgba(0,0,0,.55);font-size:12px}
+  #lmenu .mi{padding:7px 10px;border-radius:5px;cursor:pointer;white-space:nowrap}
+  #lmenu .mi:hover{background:#1e2a38}
+  #lmenu .mi.off{opacity:.4;cursor:default}
+  #lmenu .mi.off:hover{background:none}
+  #lmenu .mh{padding:6px 10px 7px;color:var(--dim);font-size:10.5px;
+             border-bottom:1px solid #223044;margin-bottom:3px}
+  /* The capture panel says what is being recorded, in one sentence, instead of
+     streaming the packets themselves. The .pcap is the artefact worth having -
+     a scrolling dump next to it was noise, and it could never be the whole
+     truth anyway (QEMU only flushes the real file when the capture closes). */
+  #capmsg{font-size:12px;line-height:1.65;color:var(--dim);background:#0c1119;
+          border:1px solid var(--line);border-radius:6px;padding:10px 11px}
+  #capmsg b{color:var(--fg);font-weight:600}
+  #capmsg .err{color:var(--err)}
+  #capmsg .note{display:block;margin-top:7px;color:var(--warn);font-size:11px;line-height:1.45}
+  #capstat{font-size:11px;color:var(--dim);margin:7px 0 0}
+  /* One chip per running capture, so several at once stay visible at a glance. */
+  #captabs{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
+  #captabs:empty{display:none}
+  .capchip{cursor:pointer;background:var(--panel2);border:1px solid var(--line);
+           color:var(--dim);border-radius:99px;padding:3px 9px;font-size:10px;
+           font-family:inherit;white-space:nowrap}
+  .capchip b{color:var(--fg);font-weight:600;margin-left:2px}
+  .capchip:hover{border-color:var(--accent)}
+  .capchip.on{border-color:var(--accent);color:var(--fg);background:var(--panel)}
+  .capchip.live{border-color:#ff5c5c}
+  .capchip .recdot{width:6px;height:6px;margin-right:4px}
+  .recdot{display:inline-block;width:8px;height:8px;border-radius:50%;
+          background:#ff5c5c;margin-right:6px;animation:pulse 1.1s ease-in-out infinite}
+  @keyframes pulse{50%{opacity:.25}}
   .lbl{fill:var(--dim);font-size:9.5px}
+  /* Port labels are draggable along the link, so they need a grab cursor and a
+     dark halo - once you make them big and bold they otherwise become unreadable
+     wherever they cross the link they belong to. */
+  .plbl{cursor:ew-resize;paint-order:stroke;stroke:var(--bg);stroke-width:3px;
+        stroke-linejoin:round}
+  .plbl:hover{fill:var(--accent)}
   .llbl{fill:#cfe0ff;font-size:11px;font-weight:600}
+  .ep{fill:var(--panel2);stroke:#4a6180;stroke-width:1.5;cursor:move;r:4}
+  .ep:hover{fill:var(--accent);stroke:var(--accent);r:6}
+  .ep.sel{stroke:var(--accent);fill:var(--bg)}
   .wp{fill:transparent;stroke:transparent;cursor:move}
   .wp:hover{fill:var(--accent);fill-opacity:.35;stroke:var(--accent)}
   .wp.on{fill:var(--panel2);stroke:#4a6180;stroke-width:1.5}
@@ -692,6 +1095,11 @@ BUILDER_HTML = r"""<!DOCTYPE html>
   .shp .body{stroke-width:2}
   .shp.sel .body{stroke-dasharray:6 3}
   .shp .cap{font-size:12px;font-weight:600;pointer-events:none}
+  /* Click target for a text drawing. pointer-events:all makes it catch clicks
+     even though it paints nothing. */
+  .shp .hit{fill:none;stroke:none;pointer-events:all}
+  /* A label with no text would otherwise be invisible but still eat clicks. */
+  .shp .hit.ghost{stroke-width:1;stroke-dasharray:4 3;stroke-opacity:.45}
   .rsz{fill:var(--accent);stroke:#0b0f16;stroke-width:1.5;cursor:nwse-resize}
   .shape-tools{display:flex;flex-wrap:wrap;gap:6px;padding:8px 12px}
   .stool{flex:1 1 auto;padding:6px 8px;font-size:11px;background:var(--panel2);
@@ -724,10 +1132,10 @@ BUILDER_HTML = r"""<!DOCTYPE html>
   .lrow .lbl2{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .lrow .x{color:var(--dim);cursor:pointer;padding:0 4px}
   .lrow .x:hover{color:var(--err)}
-  .snf{cursor:pointer;color:var(--dim);background:var(--panel2);border:1px solid var(--line);
+  .cap{cursor:pointer;color:var(--dim);background:var(--panel2);border:1px solid var(--line);
     border-radius:99px;padding:2px 7px;font-size:9.5px;font-family:inherit;white-space:nowrap}
-  .snf:hover{border-color:var(--warn);color:var(--warn)}
-  .snf.on{color:#1b1405;background:var(--warn);border-color:var(--warn);font-weight:600}
+  .cap:hover{border-color:var(--err);color:var(--err)}
+  .cap.on{color:#fff;background:var(--err);border-color:var(--err);font-weight:600}
 
   .fl{display:block;font-size:9.5px;letter-spacing:.7px;text-transform:uppercase;
     color:var(--dim);margin:0 0 3px}
@@ -772,6 +1180,8 @@ BUILDER_HTML = r"""<!DOCTYPE html>
     <input id="labName" value="MY-LAB" size="16" title="lab_name">
     <span id="stat" class="badge">…</span>
     <span class="sp"></span>
+    <button class="pin" id="pinL" title="Hide the device palette  ( [ )">◧</button>
+    <button class="pin" id="pinR" title="Hide the side panel  ( ] )">◨</button>
     <span id="where" class="badge"></span>
     <button id="btnClear">Clear</button>
     <button id="btnSave">Save topo.yml</button>
@@ -811,6 +1221,7 @@ BUILDER_HTML = r"""<!DOCTYPE html>
       <div class="tab" data-p="val">Checks</div>
       <div class="tab" data-p="yaml">YAML</div>
       <div class="tab" data-p="deploy">Deploy</div>
+      <div class="tab" data-p="cap">Capture</div>
     </div>
     <div class="pane on" id="p-insp"></div>
     <div class="pane" id="p-val"></div>
@@ -824,7 +1235,32 @@ BUILDER_HTML = r"""<!DOCTYPE html>
       </div>
       <pre id="log">Not started.</pre>
     </div>
+    <div class="pane" id="p-cap">
+      <div id="capnone">
+        Right-click any link on the canvas and choose <b>Start capture</b>.
+        <div style="margin-top:8px;color:var(--dim);line-height:1.5">
+          Packets are recorded inside the running VM itself, so there is no
+          sniffer device to add and nothing to redeploy. Both directions of the
+          link are captured, and you can record several links at the same time.
+          Download the <b>.pcap</b> when you are done and open it in Wireshark.
+        </div>
+      </div>
+      <div id="capbox" style="display:none">
+        <div id="captabs"></div>
+        <div id="capmsg"></div>
+        <div id="capstat"></div>
+        <div style="display:flex;gap:6px;margin:10px 0 0;flex-wrap:wrap">
+          <button id="capStop">Stop</button>
+          <button id="capDl">Download .pcap</button>
+          <button id="capStopAll" class="ghost" style="display:none">Stop all</button>
+          <button id="capRm" class="ghost"
+                  title="Remove this finished capture from the list">Remove</button>
+        </div>
+      </div>
+    </div>
   </aside>
+
+  <div id="lmenu"></div>
 
   <div id="rsz" title="drag to resize this panel · double-click to reset"><i></i></div>
 </div>
@@ -834,6 +1270,11 @@ const $ = s => document.querySelector(s);
 let CAT = null;                       // server catalog: types + their legal ports
 let S = { labName:'MY-LAB', devices:[], links:[], shapes:[] };
 let sel = null, armed = null, seq = 1;
+/* Live packet capture state. Declared with the rest of the canvas state because
+   drawCanvas() reads it to mark the link that is recording. */
+// Several links can record at once, so captures live in a map keyed by link
+// id; CAP.sel is only which one the Capture panel is showing.
+const CAP = {by:{}, sel:null, timer:null};
 let booted = false;   // guards autosave: the empty boot state must never clobber a saved draft
 
 /* ---------- boot ---------- */
@@ -967,7 +1408,7 @@ function clickPort(host, port){
   if(portUser(host,port)) return;                    // already wired
   if(!armed){ armed={host,port}; hint(`Now click a port on another device (Esc to cancel)`); refresh(); return; }
   if(armed.host===host){ armed={host,port}; refresh(); return; }   // re-arm on same device
-  S.links.push({id:'l'+(seq++), a:armed, b:{host,port}, sniffer:false});
+  S.links.push({id:'l'+(seq++), a:armed, b:{host,port}});
   armed=null; hint(''); refresh();
 }
 
@@ -1056,12 +1497,42 @@ function setRw(px){
   applyView();                       // the canvas just changed width
 }
 
+/* ---------- collapsible side panels ----------------------------------------
+   Both panels can be folded away to give the canvas the whole window, which is
+   what you want once a topology is wired and you are just arranging it. The
+   width the right panel was dragged to is kept, so unhiding restores it. */
+let hideL=false, hideR=false;
+function applyPanels(){
+  const app=$('#app');
+  app.classList.toggle('no-left', hideL);
+  app.classList.toggle('no-right', hideR);
+  const bl=$('#pinL'), br=$('#pinR');
+  bl.classList.toggle('off', hideL);
+  br.classList.toggle('off', hideR);
+  bl.title = (hideL?'Show':'Hide')+' the device palette  ( [ )';
+  br.title = (hideR?'Show':'Hide')+' the side panel  ( ] )';
+  // The empty-state tells you to click the palette, which is unhelpful advice
+  // while the palette is hidden.
+  const em=$('#empty');
+  if(em) em.innerHTML = hideL
+    ? 'Press <b>[</b> or the ◧ button to bring back the device palette.'
+    : 'Click a device on the left to add it.<br>Then click a port, then a port on another device.';
+  applyView();                       // the canvas just changed width
+}
+function togglePanel(side){
+  if(side==='l') hideL=!hideL; else hideR=!hideR;
+  applyPanels(); saveUi();
+}
+$('#pinL').onclick = ()=>togglePanel('l');
+$('#pinR').onclick = ()=>togglePanel('r');
+
 /* ---------- UI state -------------------------------------------------------
-   Zoom and panel width are per-browser preferences, not part of the lab, so
-   they live in localStorage and never travel to the server or the YAML. */
+   Zoom, panel width and which panels are folded away are per-browser
+   preferences, not part of the lab, so they live in localStorage and never
+   travel to the server or the YAML. */
 const UIK='vmmb.ui';
 function saveUi(){
-  try{ localStorage.setItem(UIK,JSON.stringify({view:view,rw:getRw()})); }catch(e){}
+  try{ localStorage.setItem(UIK,JSON.stringify({view:view,rw:getRw(),hl:hideL,hr:hideR})); }catch(e){}
 }
 function loadUi(){
   try{
@@ -1070,7 +1541,9 @@ function loadUi(){
       view={x:+u.view.x||0, y:+u.view.y||0,
             k:Math.min(ZMAX,Math.max(ZMIN,+u.view.k||1))};
     if(isFinite(u.rw)) setRw(u.rw);
+    hideL=!!u.hl; hideR=!!u.hr;
   }catch(e){}
+  applyPanels();
 }
 
 $('#zIn').onclick  = ()=>zoomBy(ZSTEP);
@@ -1111,11 +1584,19 @@ function drawCanvas(){
   for(const p of S.shapes){
     const on = sel===p.id;
     if(p.kind==='text'){
+      // The glyphs themselves are not clickable (.cap is pointer-events:none, so
+      // a caption can never steal clicks from the shape under it). A text drawing
+      // has nothing else in it, so without a hit area it could be neither
+      // selected nor deleted. The rect is sized from the real glyph box just
+      // after render - see sizeTextBoxes().
+      const empty = !(p.text||'').trim();
       s+=`<g class="shp ${on?'sel':''}" data-s="${p.id}">
+            <rect class="hit${empty?' ghost':''}" data-hit="${p.id}" rx="3"
+                  ${empty?`stroke="${p.stroke}"`:''}/>
             <text class="cap" x="${p.x}" y="${p.y}" fill="${p.stroke}"
                   style="font-size:${p.size}px">${esc(p.text||'')}</text>
-            ${on?`<rect class="body" x="${p.x-6}" y="${p.y-p.size-2}" width="${(p.text||' ').length*p.size*0.62+12}"
-                    height="${p.size+10}" fill="none" stroke="${p.stroke}" stroke-width="1" rx="3"/>`:''}
+            ${on?`<rect class="body" data-hit="${p.id}" fill="none"
+                    stroke="${p.stroke}" stroke-width="1" rx="3"/>`:''}
           </g>`;
     } else {
       const body = p.kind==='ellipse'
@@ -1140,10 +1621,14 @@ function drawCanvas(){
   const pairN={}, pairI={};
   for(const l of S.links){ const k=pairKey(l); pairI[l.id]=(pairN[k]=(pairN[k]||0)+1)-1; }
 
+  let dots='', topDots='';         // drawn after the nodes, see below
   for(const l of S.links){
     const A=S.devices.find(d=>d.hostname===l.a.host), B=S.devices.find(d=>d.hostname===l.b.host);
     if(!A||!B) continue;
-    const x1=A.x+W/2, y1=A.y+H/2, x2=B.x+W/2, y2=B.y+H/2;
+    // Where the link meets each device. Stored relative to the node box so the
+    // anchor travels with the node when it is dragged; centre by default.
+    const ea=anchor(l.ea), eb=anchor(l.eb);
+    const x1=A.x+ea.x, y1=A.y+ea.y, x2=B.x+eb.x, y2=B.y+eb.y;
     // Evenly spaced about the centre line: 2 links sit at -14/+14, 3 at -28/0/+28.
     const n=pairN[pairKey(l)]||1, i=pairI[l.id]||0;
     const spread = n>1 ? (i-(n-1)/2)*FAN : 0;
@@ -1157,24 +1642,42 @@ function drawCanvas(){
     const mx = hasW ? l.w.x : (x1+x2)/2 + nx*spread;
     const my = hasW ? l.w.y : (y1+y2)/2 + ny*spread;
     const cx = 2*mx-(x1+x2)/2, cy = 2*my-(y1+y2)/2;
-    const col = l.sniffer?'#ffc857':'#4a6180';
+    const rec = capIsRecording(l.id);
+    const col = rec?'#ff6b6b':'#4a6180';
     const curved = hasW || spread!==0;
     const d = curved ? `M${x1},${y1} Q${cx},${cy} ${x2},${y2}` : `M${x1},${y1} L${x2},${y2}`;
     // A transparent fat path under the visible one makes a 2px link easy to hit.
     s+=`<path class="lhit" data-k="${l.id}" d="${d}"/>`;
-    s+=`<path class="lnk ${sel===l.id?'sel':''}" data-k="${l.id}" d="${d}" fill="none"
+    s+=`<path class="lnk ${sel===l.id?'sel':''} ${rec?'rec':''}" data-k="${l.id}" d="${d}" fill="none"
               stroke="${col}" stroke-width="2"/>`;
-    // Port labels ride along the curve so they follow a bent link.
+    // Port labels ride along the curve so they follow a bent link, at whatever
+    // point along it you dragged them to. With the control point at the midpoint
+    // a quadratic is exactly the straight segment, so one formula covers both.
     const at = t => ({x:(1-t)*(1-t)*x1+2*(1-t)*t*cx+t*t*x2, y:(1-t)*(1-t)*y1+2*(1-t)*t*cy+t*t*y2});
-    const pa = curved?at(0.26):{x:x1+(x2-x1)*0.26,y:y1+(y2-y1)*0.26};
-    const pb = curved?at(0.74):{x:x1+(x2-x1)*0.74,y:y1+(y2-y1)*0.74};
-    s+=`<text class="lbl" x="${pa.x}" y="${pa.y-4}" text-anchor="middle">${l.a.port}</text>`;
-    s+=`<text class="lbl" x="${pb.x}" y="${pb.y-4}" text-anchor="middle">${l.b.port}</text>`;
+    const pa = at(labT(l,'a')), pb = at(labT(l,'b'));
+    const fs = labSize(l), fw = labWeight(l);
+    const pstyle = `font-size="${fs}" font-weight="${fw}"`;
+    s+=`<text class="lbl plbl" data-pl="${l.id}" data-e="a" ${pstyle}
+              x="${pa.x}" y="${pa.y-4}" text-anchor="middle">${l.a.port}
+          <title>drag to slide along the link · double-click to recentre</title></text>`;
+    s+=`<text class="lbl plbl" data-pl="${l.id}" data-e="b" ${pstyle}
+              x="${pb.x}" y="${pb.y-4}" text-anchor="middle">${l.b.port}
+          <title>drag to slide along the link · double-click to recentre</title></text>`;
     let dy = -12;
     if(l.label){ s+=`<text class="llbl" x="${mx}" y="${my+dy}" text-anchor="middle">${esc(l.label)}</text>`; dy -= 13; }
-    if(l.sniffer) s+=`<text class="lbl" x="${mx}" y="${my+dy}" text-anchor="middle" fill="#ffc857">◉ capture</text>`;
+    if(rec) s+=`<text class="lbl" x="${mx}" y="${my+dy}" text-anchor="middle" fill="#ff6b6b">● recording</text>`;
     s+=`<circle class="wp ${hasW?'on':''}" data-w="${l.id}" cx="${mx}" cy="${my}" r="6">
           <title>drag to bend this link · double-click to straighten</title></circle>`;
+    // Endpoint handles go above the nodes - they sit on the device box, so drawn
+    // in link order they would be buried under it and impossible to grab.
+    // Parallel links all default to the same anchor, so their handles stack; the
+    // selected link's go last, which is what makes a specific one reachable.
+    const dot = (e,x,y) => `<circle class="ep ${sel===l.id?'sel':''}" data-ep="${l.id}"
+          data-e="${e}" cx="${x}" cy="${y}" r="4">
+          <title>drag to move where this link meets ${e==='a'?esc(l.a.host):esc(l.b.host)}`
+          + ` · double-click to recentre</title></circle>`;
+    const pair = dot('a',x1,y1) + dot('b',x2,y2);
+    if(sel===l.id) topDots += pair; else dots += pair;
   }
   for(const d of S.devices){
     const n = S.links.filter(l=>l.a.host===d.hostname||l.b.host===d.hostname).length;
@@ -1186,7 +1689,9 @@ function drawCanvas(){
           ${st.ip?`<text class="ip" x="10" y="46">${st.ip}</text>`:''}
         </g>`;
   }
+  s += dots + topDots;             // endpoint handles sit on top of the devices
   svg.innerHTML=s;
+  sizeTextBoxes(svg);
   svg.querySelectorAll('.node').forEach(g=>{
     g.onmousedown = e => startDrag(e, g.dataset.id);
     g.onclick = () => { sel=g.dataset.id; refresh(); };
@@ -1202,11 +1707,27 @@ function drawCanvas(){
   });
   svg.querySelectorAll('[data-k]').forEach(p=>{
     p.onclick = e => { e.stopPropagation(); sel=p.dataset.k; refresh(); showTab('insp'); };
+    p.oncontextmenu = e => { e.preventDefault(); e.stopPropagation();
+                             sel=p.dataset.k; refresh(); openLinkMenu(e, p.dataset.k); };
   });
   svg.querySelectorAll('.wp').forEach(c=>{
     c.onmousedown = e => { e.stopPropagation(); startWpDrag(e, c.dataset.w); };
     c.ondblclick  = e => { e.stopPropagation();
       const l=S.links.find(x=>x.id===c.dataset.w); if(l){ delete l.w; refresh(); } };
+  });
+  svg.querySelectorAll('.plbl').forEach(t=>{
+    t.onmousedown = e => { e.stopPropagation(); ldrag={id:t.dataset.pl, end:t.dataset.e}; };
+    t.onclick     = e => { e.stopPropagation(); sel=t.dataset.pl; refresh(); showTab('insp'); };
+    t.ondblclick  = e => { e.stopPropagation();
+      const l=S.links.find(x=>x.id===t.dataset.pl);
+      if(l){ delete l[t.dataset.e==='a'?'ta':'tb']; refresh(); } };
+  });
+  svg.querySelectorAll('.ep').forEach(c=>{
+    c.onmousedown = e => { e.stopPropagation(); edrag={id:c.dataset.ep, end:c.dataset.e}; };
+    c.onclick     = e => { e.stopPropagation(); sel=c.dataset.ep; refresh(); showTab('insp'); };
+    c.ondblclick  = e => { e.stopPropagation();
+      const l=S.links.find(x=>x.id===c.dataset.ep);
+      if(l){ delete l[c.dataset.e==='a'?'ea':'eb']; refresh(); } };
   });
   svg.onclick = e => {
     if(panned){ panned=false; return; }        // that click was a pan, not a deselect
@@ -1214,7 +1735,46 @@ function drawCanvas(){
   };
 }
 
-let drag=null, wdrag=null, sdrag=null, rdrag=null;
+let drag=null, wdrag=null, sdrag=null, rdrag=null, ldrag=null, edrag=null;
+// Port-label defaults. Kept here rather than inline so a link that has never
+// been touched and one that was explicitly reset render identically.
+const PLS=9.5, PLW=400, PLA=0.26, PLB=0.74;
+const labSize   = l => isFinite(l.ps) ? l.ps : PLS;
+const labWeight = l => isFinite(l.pw) ? l.pw : PLW;
+const labT      = (l,e) => { const v = e==='a' ? l.ta : l.tb;
+                             return isFinite(v) ? v : (e==='a'?PLA:PLB); };
+const anchor    = a => (a && isFinite(a.x) && isFinite(a.y)) ? a : {x:W/2, y:H/2};
+// Nearest point on the drawn curve to the cursor. Sampling beats solving the
+// cubic for dp/dt: it is exact enough at any zoom and cannot pick a root that
+// lies off the segment.
+function nearestT(pt, x1, y1, cx, cy, x2, y2){
+  let best=0.5, bd=Infinity;
+  for(let i=0;i<=120;i++){
+    const t=i/120, u=1-t;
+    const x=u*u*x1+2*u*t*cx+t*t*x2, y=u*u*y1+2*u*t*cy+t*t*y2;
+    const d=(x-pt.x)**2+(y-pt.y)**2;
+    if(d<bd){ bd=d; best=t; }
+  }
+  return Math.min(0.95, Math.max(0.05, best));
+}
+// Geometry of one link, shared by the renderer and the drag handlers so a label
+// dragged to a spot lands exactly where the cursor is.
+function linkGeom(l){
+  const A=S.devices.find(d=>d.hostname===l.a.host), B=S.devices.find(d=>d.hostname===l.b.host);
+  if(!A||!B) return null;
+  const ea=anchor(l.ea), eb=anchor(l.eb);
+  const x1=A.x+ea.x, y1=A.y+ea.y, x2=B.x+eb.x, y2=B.y+eb.y;
+  const same = m => (m.a.host<m.b.host? m.a.host+'\u0000'+m.b.host : m.b.host+'\u0000'+m.a.host);
+  const peers = S.links.filter(m=>same(m)===same(l));
+  const n=peers.length, i=peers.findIndex(m=>m.id===l.id);
+  const spread = n>1 ? (i-(n-1)/2)*FAN : 0;
+  const vlen=Math.hypot(x2-x1,y2-y1)||1;
+  const nx=-(y2-y1)/vlen, ny=(x2-x1)/vlen;
+  const hasW = l.w && isFinite(l.w.x) && isFinite(l.w.y);
+  const mx = hasW ? l.w.x : (x1+x2)/2 + nx*spread;
+  const my = hasW ? l.w.y : (y1+y2)/2 + ny*spread;
+  return {A,B,x1,y1,x2,y2, cx:2*mx-(x1+x2)/2, cy:2*my-(y1+y2)/2};
+}
 function svgPt(e){
   // getScreenCTM folds in the viewBox, so this stays correct at any zoom/pan.
   const svg=$('#cv'), m=svg.getScreenCTM();
@@ -1253,6 +1813,23 @@ document.addEventListener('mousemove',e=>{
     const pt=svgPt(e);
     p.x=pt.x-sdrag.dx; p.y=pt.y-sdrag.dy; drawCanvas(); return;
   }
+  if(ldrag){
+    const l=S.links.find(x=>x.id===ldrag.id); if(!l) return;
+    const g=linkGeom(l); if(!g) return;
+    const t=nearestT(svgPt(e), g.x1,g.y1,g.cx,g.cy,g.x2,g.y2);
+    l[ldrag.end==='a'?'ta':'tb']=t; drawCanvas(); return;
+  }
+  if(edrag){
+    const l=S.links.find(x=>x.id===edrag.id); if(!l) return;
+    const dev=S.devices.find(d=>d.hostname===(edrag.end==='a'?l.a.host:l.b.host));
+    if(!dev) return;
+    // Clamped to the device box: an endpoint that could roam free would leave
+    // the link visibly detached from the device it is wired to.
+    const pt=svgPt(e);
+    l[edrag.end==='a'?'ea':'eb'] = {x: Math.min(W, Math.max(0, pt.x-dev.x)),
+                                    y: Math.min(H, Math.max(0, pt.y-dev.y))};
+    drawCanvas(); return;
+  }
   if(wdrag){
     const l=S.links.find(x=>x.id===wdrag.id); if(!l) return;
     l.w=svgPt(e); drawCanvas(); return;
@@ -1263,11 +1840,11 @@ document.addEventListener('mousemove',e=>{
   d.x=pt.x-drag.dx; d.y=pt.y-drag.dy; drag.moved=true; drawCanvas();
 });
 document.addEventListener('mouseup',()=>{
-  if(drag||wdrag||sdrag||rdrag) saveDraft();      // persist the new layout
+  if(drag||wdrag||sdrag||rdrag||ldrag||edrag) saveDraft();   // persist the new layout
   if(pdrag){ $('#cv').classList.remove('panning'); pdrag=null; saveUi(); }
   if(rzdrag){ rzdrag=false; document.body.classList.remove('rsz-on');
               $('#rsz').classList.remove('on'); saveUi(); }
-  drag=null; wdrag=null; sdrag=null; rdrag=null;
+  drag=null; wdrag=null; sdrag=null; rdrag=null; ldrag=null; edrag=null;
 });
 document.addEventListener('keydown',e=>{
   if(e.key==='Escape'){ armed=null; hint(''); refresh(); }
@@ -1277,7 +1854,30 @@ document.addEventListener('keydown',e=>{
   else if(e.key==='-'||e.key==='_'){ e.preventDefault(); zoomBy(1/ZSTEP); }
   else if(e.key==='0') resetView();
   else if(e.key==='f'||e.key==='F') fitView();
+  else if(e.key==='[') togglePanel('l');
+  else if(e.key===']') togglePanel('r');
 });
+
+/* A text drawing is clickable through a transparent rect rather than through its
+   glyphs, so the gaps between letters count too and an empty label still has
+   something to grab. The box can only be measured once the text is in the DOM. */
+function sizeTextBoxes(svg){
+  svg.querySelectorAll('.shp [data-hit]').forEach(r=>{
+    const g = r.parentNode, t = g.querySelector('text');
+    const p = S.shapes.find(x=>x.id===r.dataset.hit);
+    if(!t || !p) return;
+    let bb;
+    try { bb = t.getBBox(); } catch(_) { bb = null; }
+    // An empty <text> measures as nothing, so fall back to a box big enough to
+    // aim at. Same for a shape that has not been laid out yet.
+    const box = (bb && bb.width > 1)
+      ? {x:bb.x-6, y:bb.y-4, w:bb.width+12, h:bb.height+8}
+      : {x:p.x-6, y:p.y-p.size-2, w:64, h:p.size+10};
+    r.setAttribute('x', box.x);       r.setAttribute('y', box.y);
+    r.setAttribute('width',  Math.max(box.w, 18));
+    r.setAttribute('height', Math.max(box.h, 14));
+  });
+}
 
 function drawInspector(){
   const p=$('#p-insp');
@@ -1289,7 +1889,7 @@ function drawInspector(){
       s += `<label class="fl">Text</label>
             <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
               <input id="shtext" value="${esc(p.text||'')}" spellcheck="false" style="flex:1">
-              <button id="shdel">Delete</button></div>`;
+              <button id="shdel" title="Delete this drawing">Delete</button></div>`;
       s += `<div class="crow"><span style="width:52px">Border</span>
               <input type="color" id="shstroke" value="${esc(p.stroke||'#4a6180')}"></div>`;
       if(p.kind!=='text'){
@@ -1310,13 +1910,27 @@ function drawInspector(){
             <div style="display:flex;gap:6px;align-items:center;margin-bottom:8px">
               <input id="lktext" value="${esc(k.label||'')}" spellcheck="false"
                      placeholder="e.g. 10G to core" style="flex:1">
-              <button id="lkdel">Delete</button></div>`;
+              <button id="lkdel" title="Delete the whole link, not just its label">Delete</button></div>`;
       s += `<div class="meta">${esc(A.host)}:${A.port} ↔ ${esc(B.host)}:${B.port}</div>`;
+      const recK = capIsRecording(k.id);
       s += `<div style="display:flex;gap:6px;margin:8px 0">
-              <button class="snf ${k.sniffer?'on':''}" id="lksnf" data-s="${k.id}">${k.sniffer?'◉ capturing':'○ capture'}</button>
+              <button class="cap ${recK?'on':''}" data-cap="${k.id}"
+                      title="Record live traffic on this link">${recK?'■ stop capture':'● capture'}</button>
               <button id="lkstr" ${k.w?'':'disabled'}>Straighten</button></div>`;
-      s += `<div class="meta">Drag the handle on the link to bend it, or double-click the
-              handle to straighten. The label is decoration only.</div>`;
+      s += `<div class="sect" style="margin:10px -12px 6px;position:static">Interface labels</div>`;
+      s += `<div class="crow"><span style="width:52px">Size</span>
+              <input type="range" id="lkps" min="8" max="26" step="0.5" value="${labSize(k)}">
+              <span style="width:34px">${labSize(k)}px</span></div>`;
+      s += `<div class="crow"><span style="width:52px">Weight</span>
+              <input type="range" id="lkpw" min="300" max="900" step="100" value="${labWeight(k)}">
+              <span style="width:34px">${labWeight(k)}</span></div>`;
+      s += `<div style="display:flex;gap:6px;margin:6px 0">
+              <button id="lkpall" title="Use this size and weight on every link">Apply to all links</button>
+              <button id="lkprst" title="Back to the default size, weight and positions">Reset</button></div>`;
+      s += `<div class="meta">Drag an interface name to slide it along the link, or the
+              dot at either end to move where the link meets the device. Double-click
+              either to recentre it. Drag the handle mid-link to bend it. All of this is
+              decoration - it never reaches the topology file.</div>`;
     } else {
       s = `<div style="color:var(--dim);font-size:11.5px">Select a device, a link or a drawing.</div>`;
     }
@@ -1341,16 +1955,16 @@ function drawInspector(){
       return `<span class="${cls}" data-p="${pt}" title="${ttl}">${pt}</span>`;
     }).join('');
   }
-  const nsnf = S.links.filter(l=>l.sniffer).length;
   s += `<div class="sect" style="margin:12px -12px 6px;position:static">Links (${S.links.length})</div>`;
-  s += S.links.length ? S.links.map(l=>
-      `<div class="lrow">
+  s += S.links.length ? S.links.map(l=>{
+      const r = capIsRecording(l.id);
+      return `<div class="lrow">
          <span class="lbl2">${esc(l.a.host)}:${l.a.port} ↔ ${esc(l.b.host)}:${l.b.port}</span>
-         <button class="snf ${l.sniffer?'on':''}" data-s="${l.id}"
-                 title="Splice a packet-capture VM into this link">${l.sniffer?'◉ capturing':'○ capture'}</button>
-         <span class="x" data-l="${l.id}" title="delete link">✕</span></div>`).join('')
+         <button class="cap ${r?'on':''}" data-cap="${l.id}"
+                 title="Record live traffic on this link">${r?'■ stop':'● capture'}</button>
+         <span class="x" data-l="${l.id}" title="delete link">✕</span></div>`; }).join('')
     : `<div style="color:var(--dim);font-size:11px">No links yet.</div>`;
-  if(nsnf) s += `<div class="meta" style="color:var(--warn)">A <b>sniffer1</b> VM is added automatically and spliced into ${nsnf} link${nsnf===1?'':'s'}. Capture with tcpdump on its eth ports.</div>`;
+  if(S.links.length) s += `<div class="meta">Capture records inside the running VM - deploy the lab first, then hit ● capture (or right-click the link).</div>`;
   p.innerHTML=s;
 
   if(d){
@@ -1404,11 +2018,37 @@ function drawInspector(){
     t.onkeydown = e => { if(e.key==='Enter') e.target.blur(); };
     $('#lkdel').onclick = ()=>removeSelected();
     $('#lkstr').onclick = ()=>{ delete lk.w; refresh(); };
+    // Sliders redraw live but deliberately do not rebuild the inspector, which
+    // would yank focus out of the slider mid-drag.
+    const slider = (id, prop, suffix) => {
+      const el=$(id); if(!el) return;
+      el.oninput = e => {
+        lk[prop] = parseFloat(e.target.value);
+        const out = e.target.parentElement.querySelector('span:last-child');
+        if(out) out.textContent = e.target.value + suffix;
+        drawCanvas();
+      };
+      el.onchange = () => saveDraft();
+    };
+    slider('#lkps', 'ps', 'px');
+    slider('#lkpw', 'pw', '');
+    $('#lkpall').onclick = ()=>{
+      const ps=labSize(lk), pw=labWeight(lk);
+      S.links.forEach(l=>{ l.ps=ps; l.pw=pw; });
+      refresh();
+    };
+    $('#lkprst').onclick = ()=>{
+      ['ps','pw','ta','tb','ea','eb'].forEach(k=>delete lk[k]);
+      refresh();
+    };
   }
   p.querySelectorAll('.x').forEach(el=>
     el.onclick=()=>{ S.links=S.links.filter(l=>l.id!==el.dataset.l); refresh(); });
-  p.querySelectorAll('.snf').forEach(el=>
-    el.onclick=()=>{ const l=S.links.find(x=>x.id===el.dataset.s); l.sniffer=!l.sniffer; refresh(); });
+  p.querySelectorAll('.cap').forEach(el=>
+    el.onclick=()=>{
+      const id = el.dataset.cap;
+      if(capIsRecording(id)) capStop(id); else capStart(id);
+    });
 }
 
 /* ---------- server-side rules ---------- */
@@ -1513,6 +2153,9 @@ $('#btnDeploy').onclick = ()=>{
   fetch('/api/deploy',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify(p)}).then(r=>r.json()).then(r=>{
       if(!r.ok){ alert('Deploy refused:\n\n'+(r.errors||[r.message]).join('\n')); return; }
+      // The log lives in the right panel, so a hidden panel would make a deploy
+      // look like it did nothing at all.
+      if(hideR) togglePanel('r');
       showTab('deploy'); $('#log').textContent=''; pollLog(0);
     });
 };
@@ -1529,6 +2172,233 @@ function pollLog(off){
     else if(r.rc!==null) $('#log').textContent += `\n=== finished, exit code ${r.rc} ===\n`;
   });
 }
+
+/* ---------- packet capture ---------- */
+/* The dump runs inside the VM's own QEMU process, and QEMU only flushes it when
+   it is closed - so while a capture runs its file size and contents tell you
+   nothing. The server therefore rotates a second, short-lived dump on the same
+   NIC purely to keep a packet counter moving. The frames it decodes are counted
+   and thrown away: the panel says what is being recorded and how much of it has
+   gone by, and the .pcap you download is the uninterrupted one. */
+
+function linkById(id){ return S.links.find(l=>l.id===id) || null; }
+
+function openLinkMenu(e, id){
+  const l = linkById(id); if(!l) return;
+  const busy = capIsRecording(id);
+  const done = CAP.by[id] && CAP.by[id].id;   // finished, file still downloadable
+  const m = $('#lmenu');
+  m.innerHTML =
+    `<div class="mh">${esc(l.a.host)} ${esc(l.a.port)} &harr; ${esc(l.b.host)} ${esc(l.b.port)}</div>` +
+    (busy
+      ? `<div class="mi" data-a="stop">■ Stop capture</div>
+         <div class="mi" data-a="dl">⭳ Stop &amp; download .pcap</div>
+         <div class="mi" data-a="show">☰ Show capture</div>`
+      : `<div class="mi" data-a="start">● Start capture</div>` +
+        (done ? `<div class="mi" data-a="dl">⭳ Download last .pcap</div>` : '')) +
+    `<div class="mi" data-a="del">✕ Delete link</div>`;
+  m.style.display='block';
+  // Keep the menu on screen when the click lands near an edge.
+  const r = m.getBoundingClientRect();
+  m.style.left = Math.min(e.clientX, innerWidth  - r.width  - 8) + 'px';
+  m.style.top  = Math.min(e.clientY, innerHeight - r.height - 8) + 'px';
+  m.querySelectorAll('.mi').forEach(mi=>mi.onclick=()=>{
+    if(mi.classList.contains('off')) return;
+    closeLinkMenu();
+    const a = mi.dataset.a;
+    if(a==='start') capStart(id);
+    else if(a==='stop') capStop(id);
+    else if(a==='dl') capDownload(id);
+    else if(a==='show') showTab('cap');
+    else if(a==='del'){ S.links=S.links.filter(x=>x.id!==id); sel=null; refresh(); }
+  });
+}
+function closeLinkMenu(){ $('#lmenu').style.display='none'; }
+document.addEventListener('mousedown', e=>{ if(!e.target.closest('#lmenu')) closeLinkMenu(); });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape') closeLinkMenu(); });
+window.addEventListener('blur', closeLinkMenu);
+
+// The canvas shows the recording animation and the panels show the stop
+// buttons, so both have to follow the capture state - but without saveDraft(),
+// which has no business running every few seconds behind a poll.
+function capRedraw(){ drawCanvas(); drawInspector(); }
+
+function capStart(id){
+  const l = linkById(id); if(!l) return;
+  if(CAP.by[id] && CAP.by[id].running) { CAP.sel = id; showTab('cap'); capRenderAll(); return; }
+  showTab('cap');
+  // The two ends are copied in rather than looked up from the link on every
+  // render, so the sentence still names them if the link is deleted from the
+  // canvas while the capture is running.
+  CAP.by[id] = {id:null, link:id, running:false, starting:true, name:'', note:'',
+                a:{host:l.a.host, port:l.a.port}, b:{host:l.b.host, port:l.b.port},
+                label:`${l.a.host} ${l.a.port} \u2194 ${l.b.host} ${l.b.port}`,
+                total:0, bytes:0, seconds:0, stopReason:''};
+  CAP.sel = id;
+  capRenderAll();
+  fetch('/api/capture/start',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({a:l.a,b:l.b})}).then(r=>r.json()).then(r=>{
+      const c = CAP.by[id]; if(!c) return;
+      c.starting = false;
+      if(!r.ok){ c.error = r.error; c.running = false; capRenderAll(); capRedraw(); return; }
+      c.id=r.id; c.running=true; c.name=r.name;
+      if(r.note) c.note = r.note;
+      capRedraw(); capRenderAll();
+      capSchedule();
+    }).catch(err=>{ const c=CAP.by[id]; if(c){ c.starting=false; c.error=String(err); }
+                    capRenderAll(); });
+}
+
+/* One timer drives every running capture. Polling is what rotates the preview
+   dump server-side, which is what keeps each packet counter moving, so they all
+   have to be kept turning - not just the one on screen. It is also the browser's
+   only "still here" signal: the server stops a capture nobody has polled for
+   two minutes, so a poll that covers only the selected capture would let the
+   others be reaped as abandoned. */
+function capSchedule(){
+  clearTimeout(CAP.timer);
+  CAP.timer = setTimeout(capPollAll, 3000);
+}
+
+function capPollAll(){
+  const live = Object.values(CAP.by).filter(c=>c.running && c.id);
+  if(!live.length) return;
+  Promise.all(live.map(c =>
+    fetch('/api/capture/poll?id='+encodeURIComponent(c.id))
+      .then(r=>r.json())
+      .then(r=>{
+        if(!r.ok){ c.error = r.error||''; c.running = false; return; }
+        c.running=r.running; c.total=r.total; c.bytes=r.bytes;
+        c.seconds=r.seconds; c.stopReason=r.stopReason||'';
+      })
+      .catch(()=>{})
+  )).then(()=>{
+    capRenderAll(); capRedraw();
+    if(Object.values(CAP.by).some(c=>c.running)) capSchedule();
+  });
+}
+
+/* ---- rendering ---- */
+function capRenderAll(){
+  const all = Object.values(CAP.by);
+  $('#capnone').style.display = all.length ? 'none' : '';
+  $('#capbox').style.display  = all.length ? 'block' : 'none';
+  if(!all.length) return;
+  if(!CAP.by[CAP.sel]) CAP.sel = all[all.length-1].link;
+
+  // One chip per capture, so several running at once stay visible and
+  // switchable instead of the panel only ever knowing about the last one.
+  $('#captabs').innerHTML = all.map(c=>{
+    const on = c.link===CAP.sel;
+    const dot = c.running ? '<span class="recdot"></span>' : (c.error?'✕ ':'■ ');
+    return `<button class="capchip ${on?'on':''} ${c.running?'live':''}" data-ct="${c.link}"
+              title="${esc(c.label)}">${dot}${esc(shortLabel(c))} <b>${c.total}</b></button>`;
+  }).join('');
+  $('#captabs').querySelectorAll('[data-ct]').forEach(b=>
+    b.onclick = ()=>{ CAP.sel = b.dataset.ct; capRenderAll(); });
+
+  const nlive = all.filter(c=>c.running).length;
+  $('#capStopAll').style.display = nlive > 1 ? '' : 'none';
+  $('#capStopAll').textContent = `Stop all (${nlive})`;
+
+  const c = CAP.by[CAP.sel];
+  $('#capStop').disabled = !c.running;
+  $('#capDl').disabled   = !c.id;
+  // Removing a capture that is still recording would strand the dump inside
+  // QEMU with nothing left on screen to stop it.
+  $('#capRm').disabled   = !!c.running;
+
+  $('#capmsg').innerHTML = capSentence(c)
+    + (c.note ? `<span class="note">${esc(c.note)}</span>` : '');
+
+  if(c.starting){
+    $('#capstat').textContent = 'attaching to the running VM, this takes a few seconds…';
+  } else if(c.error){
+    $('#capstat').textContent = '';
+  } else {
+    // QEMU buffers the continuous dump, so its file size lags far behind what
+    // has actually been recorded - reporting it live would read '0.0 KB' beside
+    // a rising packet count. The size is only meaningful once the file is closed.
+    const kb = (c.bytes/1024).toFixed(1);
+    $('#capstat').innerHTML = `${c.total} packet${c.total===1?'':'s'} · ${c.seconds}s`
+      + (c.running
+          ? ' · the .pcap keeps everything, including anything counted after this'
+          : ` · ${kb} KB`)
+      + (!c.running && c.stopReason?` · ${esc(c.stopReason)}`:'');
+  }
+}
+
+/* One sentence naming what is being recorded and where. This replaced a live
+   packet dump: the list could never be complete (QEMU flushes the real file
+   only when the capture closes), so it invited people to trust the wrong
+   artefact. The .pcap is the answer; this just says it is being written. */
+function capSentence(c){
+  const where = `link <b>${esc(c.a.port)} \u2194 ${esc(c.b.port)}</b> between nodes `
+              + `<b>${esc(c.a.host)}</b>, <b>${esc(c.b.host)}</b>`;
+  if(c.error)    return `<span class="err">\u2715 ${esc(c.error)}</span>`;
+  if(c.starting) return `Starting capture on ${where}\u2026`;
+  if(c.running)  return `<span class="recdot"></span>Traffic is captured on ${where}`;
+  return `Capture stopped on ${where}. Download the .pcap to open it in Wireshark.`;
+}
+
+/* Chips have to stay narrow, so name the far ends rather than the full link.
+   Read from the capture's own copy, so a chip still names its devices after the
+   link has been deleted from the canvas. */
+function shortLabel(c){
+  return `${c.a.host}\u2194${c.b.host}`;
+}
+
+function capStop(id){
+  const c = CAP.by[id || CAP.sel]; if(!c || !c.id || !c.running) return;
+  c.running = false;
+  $('#capstat').textContent='stopping…';
+  fetch('/api/capture/stop',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({id:c.id})}).then(r=>r.json()).then(r=>{
+      if(r.ok){ c.total=r.total; c.bytes=r.bytes; c.seconds=r.seconds;
+                c.stopReason=r.stopReason||''; }
+      capRenderAll(); capRedraw();
+    });
+}
+
+function capStopAll(){
+  Object.values(CAP.by).filter(c=>c.running).forEach(c=>capStop(c.link));
+}
+
+function capDownload(id){
+  const c = CAP.by[id || CAP.sel]; if(!c || !c.id) return;
+  c.running = false; capRedraw();
+  // Downloading closes the capture first, so the file is complete rather than
+  // whatever QEMU happened to have flushed.
+  location.href = '/api/capture/download?id='+encodeURIComponent(c.id);
+  setTimeout(()=>{ fetch('/api/capture/poll?id='+encodeURIComponent(c.id))
+    .then(r=>r.json()).then(r=>{ if(r.ok){ c.total=r.total; c.bytes=r.bytes;
+      c.seconds=r.seconds; c.running=r.running; c.stopReason=r.stopReason||''; }
+      capRenderAll(); capRedraw(); }); }, 1200);
+}
+
+function capIsRecording(id){ const c=CAP.by[id]; return !!(c && c.running); }
+
+$('#capStop').onclick   = ()=>capStop();
+$('#capDl').onclick     = ()=>capDownload();
+$('#capStopAll').onclick= capStopAll;
+/* Drop a finished capture from the panel. Without this the chip list only ever
+   grows: one entry per link you have ever recorded, for the life of the page.
+   The .pcap on the pod is untouched - this only forgets it here. */
+$('#capRm').onclick     = ()=>{
+  const c = CAP.by[CAP.sel];
+  if(!c || c.running) return;
+  delete CAP.by[c.link];
+  CAP.sel = null;
+  capRenderAll(); capRedraw();
+};
+// Closing the tab would otherwise leave QEMU dumping until the server's
+// watchdog notices. sendBeacon still goes out during unload.
+window.addEventListener('pagehide', ()=>{
+  if(!navigator.sendBeacon) return;
+  Object.values(CAP.by).filter(c=>c.running && c.id).forEach(c=>
+    navigator.sendBeacon('/api/capture/stop',
+      new Blob([JSON.stringify({id:c.id})], {type:'application/json'})));
+});
 
 /* ---------- tabs ---------- */
 function showTab(p){

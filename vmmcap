@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""
+vmmcap - capture packets on a VMM lab link, straight into a .pcap file.
+
+No sniffer VM, no bridges, no redeploy. Works on a lab that is already running,
+and captures BOTH directions of the link.
+
+    ./vmmcap list R1                 # show R1's links and who is on the far end
+    ./vmmcap run R1 -s 30            # only one link? just capture it
+    ./vmmcap run R1 --to R2 -s 30    # pick the R1<->R2 link
+    ./vmmcap start R1 --to R2        # start now, stop later
+    ./vmmcap stop R1                 # stop and report where the .pcap is
+
+This is a thin front end. The capture itself lives in vmm.py (which also
+exposes it as 'vmm.py --capture' and behind the builder's right-click menu), so
+there is exactly one implementation to keep correct.
+"""
+import argparse
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _reexec_under_venv(exc):
+    """vmm.py needs junos-eznc and jinja2, which usually live in a venv.
+
+    Being run as a bare ./vmmcap is the whole point of this script, so rather
+    than telling the user to remember the interpreter, find the venv the rest
+    of the toolchain already uses and start again inside it.
+    """
+    if os.environ.get("VMMCAP_REEXEC"):        # already tried; don't loop
+        sys.exit(f"❌ vmmcap needs vmm.py's dependencies ({exc}).\n"
+                 f"   Install them, or run it with your venv's python.")
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "venv", "bin", "python3"),
+        os.path.join(here, ".venv", "bin", "python3"),
+        os.path.expanduser("~/venv/bin/python3"),
+        os.path.expanduser("~/.venv/bin/python3"),
+    ]
+    for python in candidates:
+        if os.path.isfile(python) and os.access(python, os.X_OK):
+            os.environ["VMMCAP_REEXEC"] = "1"
+            os.execv(python, [python, os.path.abspath(__file__)] + sys.argv[1:])
+    sys.exit(f"❌ vmmcap needs vmm.py's dependencies ({exc}).\n"
+             f"   Looked for a venv in: {', '.join(candidates)}")
+
+
+try:
+    import vmm
+except ImportError as exc:
+    _reexec_under_venv(exc)
+
+
+def do_list(args):
+    running = vmm.running_vms()
+    if not running:
+        sys.exit("❌ No VMs are running. Deploy the lab first.")
+    rows = [r for r in vmm._capture_link_table(running)
+            if r[0] == args.vm or r[0].split('_')[0] == args.vm]
+    if not rows:
+        known = sorted({v.split('_')[0] for v in running} | set(running))
+        sys.exit(f"❌ '{args.vm}' has no links. Devices: {', '.join(known)}")
+    print(f"\nLinks on {args.vm}:\n")
+    print(f"  {'netdev':<10} far end")
+    print(f"  {'-'*10} {'-'*30}")
+    for vm, peer, netdev in rows:
+        print(f"  {netdev:<10} {peer}")
+    print(f"\nCapture one with: {sys.argv[0]} run {args.vm} "
+          f"--to {rows[0][1]} -s 30\n")
+
+
+def _resolve(args):
+    running = vmm.running_vms()
+    if not running:
+        sys.exit("❌ No VMs are running. Deploy the lab first.")
+    targets = vmm.resolve_capture(args.vm, args.to, running) if args.to else None
+    if targets is None:
+        rows = [r for r in vmm._capture_link_table(running)
+                if r[0] == args.vm or r[0].split('_')[0] == args.vm]
+        peers = sorted({r[1].split('_')[0] for r in rows})
+        if len(peers) != 1:
+            sys.exit(f"❌ {args.vm} has {len(peers)} links - pick one with --to "
+                     f"({', '.join(peers) or 'none'}).")
+        targets = vmm.resolve_capture(args.vm, peers[0], running)
+    if not targets:
+        sys.exit(f"❌ No link from {args.vm} to '{args.to}'.")
+    if args.netdev:
+        targets = [t for t in targets if t['netdev'] == args.netdev] or targets
+    return targets[0]
+
+
+def do_start(args):
+    t = _resolve(args)
+    path = vmm.capture_start(t['vm'], t['netdev'], args.out, args.snaplen)
+    print(f"🎥 Capturing {t['vm']} {t['netdev']} ↔ {t['peer']}")
+    print(f"   → {path}")
+    print(f"   Stop it with: {sys.argv[0]} stop {args.vm}")
+
+
+def do_run(args):
+    sys.exit(vmm.cli_capture(args.vm, args.to, args.seconds))
+
+
+def do_stop(args):
+    sys.exit(vmm.cli_capture_stop(args.vm))
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Capture packets on a VMM lab link (no sniffer VM needed).")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pl = sub.add_parser("list", help="show a VM's links and their far ends")
+    pl.add_argument("vm")
+
+    def common(sp):
+        sp.add_argument("vm")
+        sp.add_argument("--to", help="far-end VM name; picks the link for you")
+        sp.add_argument("--netdev", help="exact netdevN, instead of --to")
+        sp.add_argument("--out", help="output .pcap path")
+        sp.add_argument("--snaplen", type=int, default=65536)
+
+    ps = sub.add_parser("start", help="start capturing (runs until 'stop')")
+    common(ps)
+    pr = sub.add_parser("run", help="capture for N seconds, then stop")
+    common(pr)
+    pr.add_argument("-s", "--seconds", type=int, default=30)
+    pt = sub.add_parser("stop", help="stop capturing")
+    pt.add_argument("vm")
+
+    args = p.parse_args()
+    {"list": do_list, "start": do_start, "run": do_run, "stop": do_stop}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    main()

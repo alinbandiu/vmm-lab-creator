@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import argparse
+import difflib
+import errno
 import yaml
 from jinja2 import Environment, FileSystemLoader
 import subprocess
@@ -22,11 +24,6 @@ from jnpr.junos.exception import ConnectError, ConfigLoadError, CommitError, Rpc
 import platform
 import threading
 
-try:
-    import paramiko
-except ImportError:
-    print("⚠️  Warning: 'paramiko' library not found. Please run 'pip3 install paramiko' to enable sniffer configuration.", file=sys.stderr)
-    paramiko = None
 # Set up basic logging for better script output and debugging
 logging.basicConfig(
     level=logging.CRITICAL + 1,
@@ -197,6 +194,41 @@ RETIRED_VM_TYPES = {
         "of the vMX10004 linecards ('vhamilton', 'vmaserati')"
     ),
 }
+
+# MX10K profiles whose FPCs are DISKLESS. They own no disk of their own: on
+# every boot they PXE the linecard image
+# 'junos-evo-install-ulc-mx-x86-64-<release>-EVO' out of the RE's own Junos
+# package, so the linecard always runs whatever release the RE image is - the
+# topology file never names it, which is exactly why a bad one is so hard to
+# spot.
+ULC_LINECARD_TYPES = {'vhamilton', 'vmaserati', 'valfaromeo'}
+
+# Oldest release observed to survive on the pod. Below this the FPC boots all
+# the way up - systemd starts platformd and aft-trio-app, chassisd on the RE
+# marks it Online and creates lc-/pfe-/pfh- ifds - and then the RE<->FPC IPC
+# drops a few minutes later and the card reboots, forever. What you see is:
+#     Slot State                    ...
+#      0    Offline ---Chassis connection dropped---
+# while 'vmm ls' still shows the FPC VM Running, which looks like anything but
+# a software version problem. Confirmed on q-pod26 with 22.4R3-S2.11 (four
+# reboot cycles in one console log, ~5 minutes apart, alongside chassisd
+# logging 'i2cs_virtual_wait_mpcsd_resp: recv from socket failed: Operation
+# timed out'); every ULC boot in the pod's console logs that did NOT loop was
+# 23.4 or newer.
+ULC_MIN_JUNOS = (23, 4)
+
+
+def junos_release_from_image(path):
+    """
+    Pull the (major, minor) release out of a Junos image filename, e.g.
+    '.../junos-virtual-x86-64-22.4R3-S2.11.vmdk' -> (22, 4).
+
+    Returns None when the filename carries no release - the pod's blessed
+    images are symlinks like 'default_image_vhamilton.img' - so the caller
+    skips the check instead of guessing a version it cannot see.
+    """
+    m = re.search(r'-(\d{2})\.(\d)(?=[R.\-])', os.path.basename(str(path)))
+    return (int(m.group(1)), int(m.group(2))) if m else None
 
 # Pairs of type groups that cannot share one generated config.
 #
@@ -453,6 +485,29 @@ def collect_topology_errors(data):
                 f"Supported types: {', '.join(sorted(SUPPORTED_VM_TYPES))}."
             )
 
+    # 0a2. Linecard software version for the DISKLESS MX10K profiles.
+    # See ULC_LINECARD_TYPES / ULC_MIN_JUNOS above: the FPCs inherit their
+    # software from the RE image, and too old a release boot-loops them. The
+    # config generates and deploys perfectly happily, so this has to be caught
+    # here or it costs a full deploy plus a console-log dig to find.
+    disks_map = data.get('disks', {}) or {}
+    for vm in data.get('vms', []):
+        if vm.get('type') not in ULC_LINECARD_TYPES:
+            continue
+        image = disks_map.get(vm.get('disk'), vm.get('disk'))
+        release = junos_release_from_image(image)
+        if release and release < ULC_MIN_JUNOS:
+            errors.append(
+                f"VM '{vm.get('hostname')}' (type '{vm.get('type')}') uses Junos "
+                f"{release[0]}.{release[1]} image '{image}'. Its FPCs are diskless and "
+                f"PXE-boot the linecard image out of that package, and releases older "
+                f"than {ULC_MIN_JUNOS[0]}.{ULC_MIN_JUNOS[1]} boot-loop: the FPC reaches "
+                f"Online, then falls to 'Offline ---Chassis connection dropped---' and "
+                f"reboots every few minutes. Point this VM's disk at a newer image - the "
+                f"pod's blessed one for this profile is "
+                f"/vmm/data/base_disks/default_images/default_image_{vm.get('type')}.img"
+            )
+
     # 0b. Hostname checks.
     # Duplicates were previously invisible: vms_by_hostname above is a dict, so a
     # repeated hostname silently collapses to one entry and every link endpoint
@@ -620,57 +675,28 @@ def iface_map(name, vm_type):
     return name
 
 # -----------------------------
-# Add Sniffers Function
+# Legacy 'sniffer' topologies
 # -----------------------------
-def add_sniffers_to_topology(data,quiet=False):
-    """
-    Finds a dedicated sniffer VM and re-plumbs the topology to place it
-    in-line on links marked with 'sniffer: true'.
-    """
-    sniffer_vm_name = None
-    if 'sniffer_disk' not in data.get('disks', {}):
-        print("⚠️  Warning: A link is marked for sniffing, but 'sniffer_disk' is not defined. No sniffers will be added.")
-        return data, None, []
+# Sniffing used to mean splicing a dedicated Linux VM into a link and bridging
+# its two interfaces. That is gone: packets are now taken straight out of the
+# running VM (see --capture and the builder's right-click menu), which needs no
+# extra device, no redeploy and no re-cabling. Old topology files still load -
+# the sniffer keys are simply ignored, with one warning so nobody wonders why
+# their sniffer VM never appeared.
+def warn_if_legacy_sniffer(data, quiet=False):
+    """Report, once, that 'sniffer:'/'sniffer_disk' no longer do anything."""
+    if quiet:
+        return
+    sniffed = [l for l in data.get('links', []) if l.get('sniffer')]
+    if not sniffed and 'sniffer_disk' not in data.get('disks', {}):
+        return
+    print("⚠️  This topology still uses the old sniffer VM "
+          f"({len(sniffed)} link(s) marked 'sniffer: true').")
+    print("   Those keys are ignored now - nothing is spliced into the link.")
+    print("   Capture live traffic instead, with no redeploy:")
+    print(f"     python3 {os.path.basename(sys.argv[0])} --capture DEVICE --to PEER")
+    print("   ...or right-click the link in the builder (--build).")
 
-    for vm in data.get('vms', []):
-        if vm.get('disk') == 'sniffer_disk':
-            sniffer_vm_name = vm.get('hostname')
-            break
-    
-    if not sniffer_vm_name:
-        print("⚠️  Warning: A link is marked for sniffing, but no VM using 'sniffer_disk' was found in the topology. No sniffers will be added.")
-        return data, None, []
-    if not quiet:
-        print(f"✅ Sniffer mode enabled")
-    
-    original_links = data.get("links", [])
-    new_links = []
-    capture_mappings = []
-    sniffer_iface_idx = 1
-
-    for link in original_links:
-        endpoints = link.get("endpoints", [])
-        if link.get('sniffer') and len(endpoints) == 2:
-            ep1, ep2 = endpoints[0], endpoints[1]
-            
-            sniffer_iface1 = f"eth{sniffer_iface_idx}"
-            sniffer_iface2 = f"eth{sniffer_iface_idx + 1}"
-            
-            new_links.append({'endpoints': [ep1, f"{sniffer_vm_name}:{sniffer_iface1}"]})
-            new_links.append({'endpoints': [ep2, f"{sniffer_vm_name}:{sniffer_iface2}"]})
-            
-            capture_mappings.append({
-                "link": f"{ep1} <--> {ep2}",
-                "capture_point": f"{sniffer_vm_name} ({sniffer_iface1} <--> {sniffer_iface2})", "ifaces": [sniffer_iface1, sniffer_iface2],
-                "sniffer_vm": sniffer_vm_name
-            })
-            
-            sniffer_iface_idx += 2
-        else:
-            new_links.append(link)
-
-    data['links'] = new_links
-    return data, sniffer_vm_name, capture_mappings
 
 
 # -----------------------------
@@ -764,12 +790,10 @@ def generate_config(topology_file, output_file, quiet=False):
         print("✅ Topology file passed all validation checks.")
     # ---------------------------
 
-    # Process sniffers: this modifies the 'data' dictionary for VMM config generation
-    # and returns mappings of original links to sniffer points.
-    sniffer_vm_name = None
+    # Links are now wired exactly as written: nothing is spliced in. Traffic is
+    # captured out of the running VM instead (--capture / builder right-click).
     capture_mappings = []
-    if any(link.get('sniffer') for link in data.get('links', [])):
-        data, sniffer_vm_name, capture_mappings = add_sniffers_to_topology(data, quiet=True)
+    warn_if_legacy_sniffer(data, quiet=quiet)
 
     # --- Process links to build VMM config data ---
     vms_by_hostname = {vm['hostname']: vm for vm in data.get('vms', [])}
@@ -870,15 +894,12 @@ def generate_config(topology_file, output_file, quiet=False):
             vbugatti_ordinal += 1
 
     # --- Build the comprehensive summary list for the output table ---
-    sniffed_link_map = {m['link']: m['capture_point'] for m in capture_mappings}
     final_summary_mappings = []
     for link in original_links_list:
         endpoints = link.get("endpoints", [])
         if len(endpoints) == 2:
-            link_str = f"{endpoints[0]} <--> {endpoints[1]}"
-            # Use sniffer info if available, otherwise an empty string as requested
-            capture_point = sniffed_link_map.get(link_str, "")
-            final_summary_mappings.append({'link': link_str, 'capture_point': capture_point})
+            final_summary_mappings.append(
+                {'link': f"{endpoints[0]} <--> {endpoints[1]}", 'capture_point': ""})
 
     # --- Emit VMs in vmm3 family order (RAW -> PREFIXED -> vbowmore last) ---
     # Stable sort keeps topology order within each rank. This only affects the
@@ -1124,6 +1145,64 @@ def verify_lab_running(config_file, settle_timeout=180, poll_interval=5):
     return problems
 
 
+def _bound_vms(timeout=180):
+    """Names still held by VMM, i.e. listed as anything other than Unbound.
+
+    Returns (ok, names). ok is False when 'vmm ls' itself failed, so the caller
+    can tell "nothing is bound" apart from "we could not find out".
+    """
+    rc, out = _run_vmm(["ls"], timeout=timeout)
+    if rc != 0:
+        return False, []
+    held = []
+    for line in out.splitlines():
+        if not line.strip():
+            continue
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        name, state = parts[0].strip(), parts[1].strip()
+        if name and state and state.lower() != "unbound":
+            held.append(name)
+    return True, sorted(held)
+
+
+def wait_for_unbind(settle_timeout=180, poll_interval=5):
+    """Wait until the previous lab has actually let go of the pod.
+
+    'vmm unbind' is documented as "terminate/cleanup" and it returns before the
+    cleanup half has finished - the same asynchrony that already bites
+    'vmm start' (see verify_lab_running). Applying the new config into that
+    window leaves the pod half in the old lab and half in the new one, and it
+    is the genuinely new VMs that fail to bind, because the names carried over
+    from the previous lab are still sitting there.
+
+    That failure is invisible at unbind time: 'vmm unbind' exits 0 and the
+    deploy only falls over two commands later, which is why it reads as
+    "unbind does not work" and gets worked around by running unbind by hand.
+
+    Returns (clear, still_held). Costs nothing when the pod is already clear.
+    """
+    deadline = time.time() + settle_timeout
+    announced = False
+    started = time.time()
+    while True:
+        ok, held = _bound_vms()
+        if not ok:
+            return True, []            # cannot tell; let the deploy proceed
+        if not held:
+            if announced:
+                print(f"   pod released after {int(time.time() - started)}s.")
+            return True, []
+        if time.time() >= deadline:
+            return False, held
+        if not announced:
+            print(f"   waiting for VMM to release {len(held)} VM(s) from the "
+                  f"previous lab (up to {settle_timeout}s)...")
+            announced = True
+        time.sleep(poll_interval)
+
+
 def run_vmm_config(config_file, force=False):
     """Applies the VMM config and starts the lab."""
     print("\n" + "="*50)
@@ -1140,6 +1219,28 @@ def run_vmm_config(config_file, force=False):
         print(f"⚠️  'vmm unbind' returned {rc} - the previous lab may still "
               f"be holding capacity.", file=sys.stderr)
         _show_vmm_output(out)
+
+    # unbind returns before its cleanup finishes; going straight into 'config'
+    # is what makes a deploy bind some VMs and silently drop the rest.
+    clear, held = wait_for_unbind()
+    if not clear:
+        # unbind is idempotent ("already unbound - ignoring"), so a second pass
+        # costs nothing and clears VMs the first one did not get to.
+        print(f"   {len(held)} VM(s) still bound - running 'vmm unbind' again...")
+        rc, out = _run_vmm(["unbind"])
+        if rc != 0:
+            _show_vmm_output(out)
+        clear, held = wait_for_unbind()
+    if not clear:
+        shown = ", ".join(held[:6]) + ("..." if len(held) > 6 else "")
+        print(f"⚠️  {len(held)} VM(s) are still bound after two unbind attempts: "
+              f"{shown}\n"
+              f"   Applying the config now tends to bind only the names that "
+              f"carried over from the\n"
+              f"   previous lab and silently drop the new ones. If this deploy "
+              f"fails, run 'vmm unbind'\n"
+              f"   by hand, check 'vmm ls' is clear, then re-run.",
+              file=sys.stderr)
 
     print("Applying vmm config!")
     rc, out = _run_vmm(["config", config_file, "-g", "vmm-default"])
@@ -1949,173 +2050,6 @@ def configure_vbrackla_serial(name, interfaces, debug=False, retries=15, delay=1
         return f"Failure: {name} ({e})"
 
 
-def _find_bridge_script():
-    """Locate br.sh - the explicit override first, then the shared scripts
-    directory, then a copy sitting next to vmm.py so a fresh checkout on a
-    machine without /homes/... still configures its sniffer."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    for path in (SNIFFER_BRIDGE_SCRIPT, os.path.join(here, "br.sh")):
-        if path and os.path.isfile(path):
-            return path
-    return None
-
-
-def _connect_sniffer(ip, attempts=10, delay=10):
-    """SSH to the sniffer, waiting for sshd. The sniffer is a Linux VM and is
-    deliberately not part of the Phase 3 boot gate, so it is routinely still
-    booting when we get here - one attempt is not enough."""
-    last_error = None
-    for n in range(1, attempts + 1):
-        try:
-            ssh = paramiko.SSHClient()
-            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            ssh.connect(ip, username=DEVICE_ROOT_USER,
-                        password=DEVICE_ROOT_PASSWORD, timeout=15,
-                        banner_timeout=25, auth_timeout=25)
-            return ssh, None
-        except Exception as exc:                       # noqa: BLE001
-            last_error = exc
-            if n < attempts:
-                print(f"   ...sniffer SSH not ready yet ({type(exc).__name__}); "
-                      f"retrying in {delay}s [{n}/{attempts - 1}]")
-                time.sleep(delay)
-    return None, last_error
-
-
-def _ssh_run(ssh, command, timeout=300):
-    """Run a command over SSH and return (exit_code, combined_output)."""
-    _, stdout, stderr = ssh.exec_command(command, timeout=timeout)
-    out = stdout.read().decode(errors="replace")
-    err = stderr.read().decode(errors="replace")
-    return stdout.channel.recv_exit_status(), (out + err).strip()
-
-
-def configure_sniffer_bridges(capture_mappings):
-    """Bridge each sniffed link's interface pair on the sniffer VM.
-
-    A sniffer sits *inside* the link - A --- eth1 [sniffer] eth2 --- B - so
-    until those two interfaces are bridged the link is simply cut in half and
-    passes no traffic at all. This uploads br.sh and runs it once per sniffed
-    link to build a transparent bridge, which is what makes the link work.
-    """
-    sniffed = [m for m in capture_mappings if m.get("ifaces")]
-    if not sniffed:
-        return True                       # no sniffed links; nothing to say
-
-    print("\n" + "=" * 50)
-    print(" 🕵️  Phase 3.5: Bridging the Capture VM")
-    print("=" * 50)
-    print("A sniffer sits inside the link, so its two interfaces must be "
-          "bridged\nor the link passes no traffic.\n")
-
-    if not paramiko:
-        print("❌ 'paramiko' is not installed, so the sniffer cannot be "
-              "configured.\n   Run: pip3 install paramiko")
-        return False
-
-    script = _find_bridge_script()
-    if not script:
-        print(f"❌ Bridging script not found. Looked for:\n"
-              f"     {SNIFFER_BRIDGE_SCRIPT}\n"
-              f"     {os.path.join(os.path.dirname(os.path.abspath(__file__)), 'br.sh')}\n"
-              f"   Point VMM_SNIFFER_SCRIPT at your br.sh, or drop a copy "
-              f"beside vmm.py.")
-        return False
-
-    host = sniffed[0].get("sniffer_vm") or "sniffer1"
-
-    # The sniffer is a Linux VM, so 'vmm ping' lists it under its plain
-    # hostname - no _RE/-re0 suffix.
-    ip = get_vmm_ip_map().get(host)
-    if not ip:
-        state = get_vmm_ping_map().get(host)
-        print(f"❌ Could not find an IP for the capture VM '{host}'.")
-        print(f"   'vmm ping' says: {state or 'it is not listed at all'}.")
-        print("   If it is Unbound, bind it and re-run with --resume.")
-        return False
-    print(f"Capture VM '{host}' is at {ip}. Uploading {os.path.basename(script)}...")
-
-    ssh, error = _connect_sniffer(ip)
-    if not ssh:
-        print(f"❌ Could not SSH to {host} at {ip}: {error}")
-        return False
-
-    try:
-        # Ask the VM which interfaces it actually has rather than trusting the
-        # topology - a half-attached link shows up here and nowhere else.
-        rc, out = _ssh_run(ssh, "ls /sys/class/net", timeout=30)
-        present = set(out.split()) if rc == 0 else set()
-
-        remote = "/root/br.sh"
-        sftp = ssh.open_sftp()
-        sftp.put(script, remote)
-        sftp.close()
-        _ssh_run(ssh, f"chmod +x {remote}", timeout=30)
-
-        ok, failed = [], []
-        for idx, mapping in enumerate(sniffed, start=1):
-            if1, if2 = mapping["ifaces"]
-            bridge = f"br{idx}"
-            label = mapping.get("link", f"{if1} <--> {if2}")
-
-            missing = [i for i in (if1, if2) if present and i not in present]
-            if missing:
-                print(f"  ✗ {bridge}: {', '.join(missing)} missing on {host} "
-                      f"(it has: {' '.join(sorted(present)) or 'nothing'})")
-                failed.append(f"{bridge} ({label}): interface(s) "
-                              f"{', '.join(missing)} do not exist")
-                continue
-
-            # br.sh is idempotent: an existing bridge keeps its netplan config
-            # and only has the transparency settings re-applied. Always running
-            # it means a lab bridged by an older version gets fixed too.
-            rc, members = _ssh_run(ssh, f"ls /sys/class/net/{bridge}/brif 2>/dev/null",
-                                   timeout=30)
-            existed = rc == 0 and {if1, if2} == set(members.split())
-            if existed:
-                print(f"  = {bridge}: {if1} <-> {if2} already bridged, re-applying transparency")
-            else:
-                print(f"  → {bridge}: bridging {if1} <-> {if2}  ({label})")
-            rc, out = _ssh_run(ssh, f"{remote} {bridge} {if1} {if2}", timeout=420)
-            if rc != 0:
-                detail = out.splitlines()[-1] if out else f"exit code {rc}"
-                print(f"  ✗ {bridge}: {detail}")
-                failed.append(f"{bridge} ({label}): {detail}")
-                continue
-
-            # Trust nothing: confirm the bridge exists with both members in it.
-            rc, members = _ssh_run(ssh, f"ls /sys/class/net/{bridge}/brif 2>/dev/null",
-                                   timeout=30)
-            if rc == 0 and {if1, if2} <= set(members.split()):
-                # Prove the link-local group addresses really are forwarded -
-                # a bridge with a zero mask silently eats LLDP and LACP.
-                _, mask = _ssh_run(ssh,
-                    f"cat /sys/class/net/{if1}/brport/group_fwd_mask", timeout=30)
-                transparent = mask.strip() not in ("", "0x0", "0")
-                note = "" if transparent else "  ⚠️  link-local frames NOT forwarded"
-                print(f"  ✓ {bridge}: up, carrying {if1} and {if2}{note}")
-                ok.append(bridge)
-            else:
-                print(f"  ✗ {bridge}: script succeeded but the bridge has no members")
-                failed.append(f"{bridge} ({label}): built but empty")
-    finally:
-        ssh.close()
-
-    print()
-    if failed and not ok:
-        print(f"❌ No capture bridges were created on {host}. "
-              f"Sniffed links will not pass traffic.")
-    elif failed:
-        print(f"⚠️  {len(ok)} of {len(sniffed)} capture bridges are up on {host}; "
-              f"the rest failed:")
-    else:
-        print(f"✅ {len(ok)} capture bridge(s) up on {host} - sniffed links pass "
-              f"traffic again.")
-        print(f"   Capture with:  ssh {DEVICE_ROOT_USER}@{ip}  then  "
-              f"tcpdump -i {sniffed[0]['ifaces'][0]} -w /tmp/capture.pcap")
-    for line in failed:
-        print(f"   - {line}")
-    return not failed
 
 
 # -----------------------------
@@ -2189,34 +2123,67 @@ def print_summary_table(topology_data):
     
     print(separator)
 # -----------------------------
-# Print Capture Info Table
+# Print Link Table
 # -----------------------------
-def print_capture_info_table(capture_mappings):
-    """Prints a table mapping all links to their capture points (sniffers or bridges)."""
-    if not capture_mappings:
+def print_capture_info_table(link_mappings):
+    """List the lab's links and how to capture traffic on one of them."""
+    if not link_mappings:
         return
 
-    columns = { "Link": 60, "Capture Point": 30 }
-    header_format = "| " + " | ".join([f"{{{key}:<{width}}}" for key, width in columns.items()]) + " |"
-    row_format = "| " + " | ".join([f"{{{key}:<{width}}}" for key, width in columns.items()]) + " |"
-    separator = "+" + "+".join(["-" * (width + 2) for width in columns.values()]) + "+"
+    width = 64
+    separator = "+" + "-" * (width + 2) + "+"
     table_width = len(separator)
 
-    print("\n" + "="*table_width)
-    print(" Link & Capture Point Summary ".center(table_width))
-    print("="*table_width)
+    print("\n" + "=" * table_width)
+    print(" Links ".center(table_width))
+    print("=" * table_width)
     print(separator)
-    print(header_format.format(**{key: key for key in columns.keys()}))
+    print(f"| {'Link':<{width}} |")
     print(separator)
-
-    for mapping in capture_mappings:
-        row_data = { "Link": mapping['link'], "Capture Point": mapping['capture_point'] }
-        print(row_format.format(**row_data))
-    
+    for mapping in link_mappings:
+        print(f"| {mapping['link'][:width]:<{width}} |")
     print(separator)
+    # Every link is capturable now, so there is no per-link capture point to
+    # print - the recording is done on the running VM, on demand.
+    print(f"\n Capture any of them live, without redeploying:")
+    print(f"   python3 {os.path.basename(sys.argv[0])} --capture DEVICE --to PEER")
+    print(f"   ...or right-click the link in the builder (--build).\n")
 # -----------------------------
 # Configuration Management Functions
 # -----------------------------
+# Which 'vmm list' image strings mean "this is a Junos device". Two different
+# shapes turn up on the pod and only the first was ever recognised:
+#
+#   1. a versioned filename someone pointed at by hand
+#      /homes/<user>/images/junos-virtual-x86-64-22.4R3-S2.11.vmdk
+#   2. the pod's blessed symlink for a profile
+#      /vmm/data/base_disks/default_images/default_image_vhamilton.img
+#
+# Shape 2 carries no 'junos' anywhere in the path, so every device sitting on
+# its default image was silently skipped by --config - and that is the common
+# case: it is what the builder writes when the Image box is left empty, and
+# what this script recommends. A lab with four REs would report two.
+JUNOS_IMAGE_RE = re.compile(
+    r'vJunos-router|vJunos-switch|junos-virtual-install|junos-x86|vqfx|vmx'
+    r'|junos-evo-install|junos-virtual',
+    re.IGNORECASE,
+)
+
+# Profiles that are not Junos and must never be picked up for config work.
+NON_JUNOS_VM_TYPES = {'server', 'vswitch', 'vrouter'}
+
+# Built from SUPPORTED_VM_TYPES rather than hard-coded, so a profile added
+# there is recognised here for free instead of quietly going missing.
+# 'default_image_vqfx10.img' is matched by the 'vqfx' stem.
+JUNOS_DEFAULT_IMAGE_RE = re.compile(
+    r'default_image_(?:'
+    + '|'.join(sorted((re.escape(t) for t in SUPPORTED_VM_TYPES - NON_JUNOS_VM_TYPES),
+                      key=len, reverse=True))
+    + r')',
+    re.IGNORECASE,
+)
+
+
 def get_junos_ips_from_vmm():
     """Retrieve active Junos device IPs from VMM by checking their image type."""
     print("⚙️  Finding active Junos devices in VMM...")
@@ -2228,7 +2195,9 @@ def get_junos_ips_from_vmm():
             if len(parts) >= 4:
                 name = parts[0]
                 image = " ".join(parts[3:])
-                if not "_FPC" in name and not "pecosim" in name and re.search(r'vJunos-router|vJunos-switch|junos-virtual-install|junos-x86|vqfx|vmx|junos-evo-install-ptx|junos-virtual', image, re.IGNORECASE):
+                if "_FPC" in name or "pecosim" in name:
+                    continue
+                if JUNOS_IMAGE_RE.search(image) or JUNOS_DEFAULT_IMAGE_RE.search(image):
                     nodes[name] = {}
 
         if not nodes:
@@ -2244,12 +2213,19 @@ def get_junos_ips_from_vmm():
                     nodes[name]["ip"] = ip
 
         ips = [info["ip"] for info in nodes.values() if "ip" in info]
-        
+
         if not ips:
             print("⚠️  No IPs found for the Junos devices in the running lab.")
             return []
 
-        print(f"✅ Found {len(ips)} active devices.")
+        # Name the devices. When this picked the wrong set the old message gave
+        # a bare count, so there was no way to tell which ones were missed.
+        named = ", ".join(f"{n} ({i['ip']})" for n, i in nodes.items() if "ip" in i)
+        print(f"✅ Found {len(ips)} active devices: {named}")
+
+        no_ip = [n for n, i in nodes.items() if "ip" not in i]
+        if no_ip:
+            print(f"⚠️  Skipping {', '.join(no_ip)} - Junos, but 'vmm ip' reports no address yet.")
         return ips
 
     except FileNotFoundError:
@@ -2343,7 +2319,7 @@ def handle_config_management(topology_file):
                 print(f"A task generated an exception: {exc}")
 
 # Junos VM types that get a baseline pushed in Phase 4 (i.e. everything except
-# 'server'/'sniffer'). Used both to decide who to wait for in Phase 3 and who
+# 'server'). Used both to decide who to wait for in Phase 3 and who
 # to configure in Phase 4.
 CONFIGURABLE_TYPES = (
     'vrouter', 'vswitch', 'vmx', 'vferrari', 'valfaromeo',
@@ -2471,7 +2447,6 @@ def re_ping_name(host, vtype):
 # prefix (et-/ge-/xe-) a given device uses.
 INTERFACE_HELP = {
     'server':     "em1, em2, ...            (data ports; em0 is management)",
-    'sniffer':    "(none - spliced onto a link with 'sniffer: true')",
     'vswitch':    "ge-0/0/0, ge-0/0/1, ...  (sequential from 0)",
     'vrouter':    "ge-0/0/0, ge-0/0/1, ...  (sequential from 0)",
     'vqfx':       "xe-0/0/0, xe-0/0/1, ...  (sequential from 0)",
@@ -2512,9 +2487,6 @@ def print_interfaces(topology_file):
     for vm in vms:
         host = vm.get('hostname', '?')
         vtype = vm.get('type', '?')
-        # 'sniffer' is a server on sniffer_disk; label it as such.
-        if vtype == 'server' and vm.get('disk') == 'sniffer_disk':
-            vtype = 'sniffer'
         help_text = INTERFACE_HELP.get(vtype, "(unknown type)")
         print(f"  {host:<{width}}  {vtype:<11} {help_text}")
     print("\nWrite links as 'hostname:interface', e.g. "
@@ -2535,7 +2507,7 @@ def print_devices(topology_file):
         }
 
     IPs are the live management addresses from 'vmm ping' (empty if the device
-    is not up yet). Only Junos devices are emitted - Linux server/sniffer VMs
+    is not up yet). Only Junos devices are emitted - Linux 'server' VMs
     are not managed over SSH with these credentials. The JSON is written to
     stdout so it can be redirected straight into a file:
 
@@ -2548,7 +2520,7 @@ def print_devices(topology_file):
     for vm in data.get('vms', []):
         vtype = vm.get('type')
         if vtype not in CONFIGURABLE_TYPES:
-            continue  # server / sniffer are Linux hosts, not Junos over SSH
+            continue  # 'server' is a Linux host, not Junos over SSH
         host = vm['hostname']
         devices[host] = {
             "ip": ip_map.get(re_ping_name(host, vtype), ""),
@@ -2573,9 +2545,6 @@ def _build_topology_html(topology_file):
     data = _load_topology(topology_file)
 
     vms = data.get('vms', [])
-    def _vtype(vm):
-        t = vm.get('type', '?')
-        return 'sniffer' if (t == 'server' and vm.get('disk') == 'sniffer_disk') else t
     known = {vm['hostname'] for vm in vms}
 
     ip_map = get_vmm_ip_map()
@@ -2583,7 +2552,7 @@ def _build_topology_html(topology_file):
     for vm in vms:
         host = vm['hostname']
         ip = ip_map.get(re_ping_name(host, vm.get('type')), '')
-        nodes.append({'id': host, 'type': _vtype(vm), 'ip': ip})
+        nodes.append({'id': host, 'type': vm.get('type', '?'), 'ip': ip})
 
     # Best-effort: pull each reachable Junos device's lo0.0 loopback address
     # over SSH so it can be shown above the icon (blank if not configured).
@@ -2600,8 +2569,7 @@ def _build_topology_html(topology_file):
         except ValueError:
             continue
         if a in known and b in known:
-            edges.append({'a': a, 'ai': ai, 'b': b, 'bi': bi,
-                          'sniffer': bool(link.get('sniffer'))})
+            edges.append({'a': a, 'ai': ai, 'b': b, 'bi': bi})
 
     html = (_TOPOLOGY_HTML
             .replace("__LAB__", json.dumps(data.get('lab_name', 'lab')))
@@ -2646,6 +2614,1134 @@ def qpod_ip():
             return "127.0.0.1"
 
 
+# -----------------------------
+# Port housekeeping
+# -----------------------------
+# 'Address already in use' on a pod host is nearly always a server the user
+# forgot to Ctrl+C - a builder in a closed tab, or one orphaned when an ssh
+# session dropped. The old advice was to go find it by hand with ss/lsof and
+# kill it, which is three commands and assumes the PID is even visible: 'ss
+# -ltnp' only reveals pid/cmd for YOUR OWN processes, so another user's server
+# on the same port appears as a listener with no owner at all. That is the case
+# that looks like "the port is stuck and there is nothing to kill".
+#
+# Our own servers are identified by their command line rather than by a pid
+# file: --serve writes one, but --build never did, and a pid file is stale the
+# moment a process dies in a way that skips its cleanup.
+_OUR_SERVER_MARKERS = ("vmm.py", "vmm_builder")
+
+
+def _proc_cmdline(pid):
+    """Full command line of <pid>, or '' when it cannot be read."""
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return f.read().replace(b"\0", b" ").decode("utf-8", "replace").strip()
+    except Exception:
+        return ""
+
+
+def port_listeners(port):
+    """
+    Who is listening on <port>?
+
+    Returns a list of {'pid', 'user', 'cmd', 'ours'} dicts - empty when the
+    port is free. 'pid' is None when the owner is another user, because the
+    kernel hides it; 'ours' means the process is one of this project's own
+    servers and is therefore safe to stop.
+
+    lsof and ss are both consulted: lsof names the user, ss sees listeners lsof
+    may miss, and on a host where only one of the two is installed the other
+    still answers.
+    """
+    found = {}
+
+    try:
+        out = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout
+        for line in out.splitlines()[1:]:            # first line is the header
+            parts = line.split()
+            if len(parts) >= 3 and parts[1].isdigit():
+                pid = int(parts[1])
+                found[pid] = {"pid": pid, "user": parts[2], "cmd": _proc_cmdline(pid) or parts[0]}
+    except Exception:
+        pass
+
+    try:
+        out = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=15).stdout
+        for line in out.splitlines():
+            # Local Address:Port is the 4th column: 0.0.0.0:5057, [::]:5057, *:5057
+            cols = line.split()
+            if len(cols) < 4 or not re.search(rf":{port}$", cols[3]):
+                continue
+            m = re.search(r"pid=(\d+)", line)
+            if m:
+                pid = int(m.group(1))
+                found.setdefault(pid, {"pid": pid, "user": None,
+                                       "cmd": _proc_cmdline(pid) or line})
+            elif not found:
+                # A listener whose owner the kernel will not reveal: another
+                # user. Recorded so the caller can say so instead of insisting
+                # the port is free.
+                found.setdefault(None, {"pid": None, "user": None, "cmd": None})
+    except Exception:
+        pass
+
+    result = []
+    for info in found.values():
+        cmd = info.get("cmd") or ""
+        info["ours"] = any(mark in cmd for mark in _OUR_SERVER_MARKERS)
+        result.append(info)
+    return result
+
+
+def port_is_free(port, host="0.0.0.0"):
+    """True when <port> can actually be bound right now - the only test that
+    matters, since it is what the server itself is about to attempt."""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def http_probe(port, host="127.0.0.1", timeout=4.0):
+    """Does something actually answer HTTP on <port>?
+
+    Returns (status, detail). A socket can be listening while the server behind
+    it is wedged, half-dead, or not an HTTP server at all - which looks exactly
+    like 'the page will not load' from a browser, so the two are reported apart
+    rather than assuming a listener means a working page.
+    """
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as s:
+            # GET, not HEAD: plenty of small servers (this project's builder
+            # included) answer HEAD with 501, which reads like a fault when the
+            # server is in fact perfectly healthy. Only the status line is read.
+            s.sendall(b"GET / HTTP/1.0\r\nHost: localhost\r\n\r\n")
+            s.settimeout(timeout)
+            data = b""
+            while b"\r\n" not in data and len(data) < 256:
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                data += chunk
+    except socket.timeout:
+        return "hung", "connected, but no HTTP reply - the server is wedged"
+    except ConnectionRefusedError:
+        return "closed", "nothing accepted the connection"
+    except OSError as exc:
+        return "closed", str(exc)
+
+    first = data.split(b"\r\n", 1)[0].decode("utf-8", "replace").strip()
+    if first.startswith("HTTP/"):
+        code = first.split()[1] if len(first.split()) > 1 else "?"
+        return "ok", f"answering (HTTP {code})"
+    if not first:
+        return "hung", "connected, but the server said nothing"
+    return "notHttp", f"answered, but not with HTTP: {first[:60]}"
+
+
+def server_status(ports=None):
+    """Report every web server of ours that is up, and whether it really works.
+
+    Answers 'is a server running, and why is the page not loading?' without
+    stopping anything - --stop-port reports the same facts but kills as it goes,
+    which is no use when all you wanted was to look.
+    """
+    seen = {}
+    for port in (ports or []):
+        seen[port] = port_listeners(port)
+
+    if not ports:
+        # No port named: find our own servers wherever they happen to be, since
+        # the whole point is usually 'I forgot which port I used'.
+        for pid, cmd in _our_server_processes():
+            for port in _ports_of_pid(pid) or _ports_in_cmdline(cmd):
+                seen.setdefault(port, port_listeners(port))
+        for port in (8080, 8081):
+            seen.setdefault(port, port_listeners(port))
+
+    rows = []
+    for port in sorted(seen):
+        holders = seen[port]
+        if not holders:
+            continue
+        state, detail = http_probe(port)
+        for h in holders:
+            rows.append({"port": port, "state": state, "detail": detail, **h})
+    return rows
+
+
+def _our_server_processes():
+    """[(pid, cmdline)] for this project's servers running as this user."""
+    out = []
+    try:
+        listing = subprocess.run(["ps", "-eo", "pid=,args="],
+                                 capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return out
+    for line in listing.splitlines():
+        line = line.strip()
+        pid, _, cmd = line.partition(" ")
+        if not pid.isdigit() or "ps -eo" in cmd:
+            continue
+        if not any(mark in cmd for mark in _OUR_SERVER_MARKERS):
+            continue
+        if not any(flag in cmd for flag in ("--build", "--serve", "serve_builder",
+                                            "vmm_builder")):
+            continue
+        out.append((int(pid), cmd))
+    return out
+
+
+def _ports_of_pid(pid):
+    """TCP ports <pid> is listening on, read from ss."""
+    ports = set()
+    try:
+        listing = subprocess.run(["ss", "-ltnp"], capture_output=True,
+                                 text=True, timeout=15).stdout
+    except Exception:
+        return ports
+    for line in listing.splitlines():
+        if f"pid={pid}," not in line and f"pid={pid})" not in line:
+            continue
+        cols = line.split()
+        if len(cols) >= 4:
+            m = re.search(r":(\d+)$", cols[3])
+            if m:
+                ports.add(int(m.group(1)))
+    return ports
+
+
+def _ports_in_cmdline(cmd):
+    """Ports named on a server's own command line - the fallback when the
+    kernel will not tell us what it bound (it happens under some containers)."""
+    ports = set()
+    for m in re.finditer(r"--(?:build-)?port[= ](\d+)", cmd or ""):
+        ports.add(int(m.group(1)))
+    return ports
+
+
+def print_server_status(ports=None):
+    """Human-readable 'what is serving right now'. Returns a shell exit code."""
+    rows = server_status(ports)
+    if not rows:
+        if ports:
+            print(f"\nNothing is listening on {', '.join(str(p) for p in ports)}.\n")
+        else:
+            print("\nNo web server of this script's is running.\n")
+            print("  Start one with:")
+            print(f"    python3 {os.path.basename(__file__)} --build      "
+                  f"# topology builder  (8081)")
+            print(f"    python3 {os.path.basename(__file__)} --serve      "
+                  f"# topology diagram  (8080)\n")
+        return 1
+
+    host = ""
+    try:
+        import socket as _socket
+        host = _socket.gethostname()
+    except Exception:
+        pass
+
+    print("\nWeb servers:\n")
+    for r in rows:
+        mark = {"ok": "✅", "hung": "⚠️ ", "notHttp": "⚠️ ",
+                "closed": "❌"}.get(r["state"], "•")
+        who = ("your own server" if r["ours"]
+               else f"another process ({r['user'] or 'unknown user'})"
+               if r["pid"] else "another user (the kernel hides the pid)")
+        print(f"  {mark} port {r['port']} - {who}")
+        if r["pid"]:
+            print(f"       pid {r['pid']}: {(r['cmd'] or '')[:90]}")
+        print(f"       {r['detail']}")
+        if r["state"] == "ok":
+            print(f"       open: http://{host or 'localhost'}:{r['port']}/")
+        elif r["ours"] and r["pid"]:
+            # A listening socket that will not serve is the confusing case: the
+            # port looks taken, so a restart refuses to bind, but nothing loads.
+            print(f"       free it with: python3 "
+                  f"{os.path.basename(__file__)} --stop-port {r['port']}")
+        else:
+            # --stop-port deliberately refuses to kill anything that is not
+            # ours, so pointing at it here would just waste a command.
+            print(f"       not this script's, so --stop-port will not touch it "
+                  f"- use another port (--port N)")
+        print()
+    return 0
+
+
+def describe_port_conflict(port, indent="   "):
+    """Explain who is holding <port>, and what can be done about it.
+
+    Every caller reaches this on an error path - a refused bind, or a
+    --stop-port that found nothing of ours - so this is the message that has to
+    tell the three cases apart: an orphan of our own (stoppable), another
+    process of this user's (named, but left alone), and another user's (the
+    kernel hides the pid, so there is nothing to kill and the answer is simply
+    a different port).
+    """
+    holders = port_listeners(port)
+    if not holders:
+        return (f"{indent}Nothing is listening on {port} now - the port may have been\n"
+                f"{indent}released as you looked, or is held in another network namespace.\n"
+                f"{indent}Try again, or use another port with --port <N>.")
+
+    lines = []
+    ours = [h for h in holders if h["ours"]]
+    mine = [h for h in holders if h["pid"] and not h["ours"]]
+    theirs = [h for h in holders if not h["pid"]]
+
+    for h in ours:
+        lines.append(f"{indent}Port {port} is held by your own server, pid {h['pid']}:")
+        lines.append(f"{indent}    {h['cmd'][:100]}")
+        lines.append(f"{indent}Close it and reuse the port with:")
+        lines.append(f"{indent}    python3 {os.path.basename(__file__)} --stop-port {port}")
+    for h in mine:
+        lines.append(f"{indent}Port {port} is held by pid {h['pid']}, which is not one of this")
+        lines.append(f"{indent}script's servers, so it will not be touched automatically:")
+        lines.append(f"{indent}    {h['cmd'][:100]}")
+        lines.append(f"{indent}Stop it yourself with 'kill {h['pid']}', or use another port.")
+    for _ in theirs:
+        lines.append(f"{indent}Port {port} is held by ANOTHER USER on this pod - the kernel hides")
+        lines.append(f"{indent}their pid, which is why nothing shows up to kill. Pick another")
+        lines.append(f"{indent}port with --port <N>; pod hosts are shared.")
+    return "\n".join(lines)
+
+
+def _terminate_pids(targets, port, timeout=8.0):
+    """SIGTERM each target, escalating to SIGKILL only if it is ignored."""
+    import signal
+
+    for h in targets:
+        pid = h["pid"]
+        print(f"⏳ Stopping pid {pid} on port {port}: {h['cmd'][:90]}")
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            print(f"❌ Not allowed to stop pid {pid} - it belongs to another user.", file=sys.stderr)
+            continue
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.25)
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+        else:
+            # Still there: a wedged server would otherwise hold the port forever.
+            print(f"   pid {pid} ignored SIGTERM after {timeout:.0f}s - sending SIGKILL.")
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            time.sleep(0.5)
+
+    # Confirm against a real bind rather than trusting the kill: that is the
+    # only thing that proves the next server will actually start.
+    deadline = time.time() + 5.0
+    while time.time() < deadline:
+        if port_is_free(port):
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def reclaim_port(port):
+    """
+    Take <port> back from an earlier server of ours so a new one can start.
+
+    This is what makes 'resume the lab on the same port' a single command: an
+    orphaned builder - one whose ssh session dropped, or that was left running
+    in a closed tab - is stopped automatically instead of turning into an
+    'Address already in use' the user has to go and clear by hand.
+
+    Only our own servers, owned by this user, are ever taken; anything else
+    returns False so the caller can explain and leave it alone. Returns True
+    when the port is free to bind.
+    """
+    targets = [h for h in port_listeners(port) if h["ours"] and h["pid"]]
+    if not targets:
+        return False
+
+    print(f"♻️  Port {port} was still held by an earlier builder of yours - reclaiming it.")
+    if _terminate_pids(targets, port):
+        print(f"✅ Port {port} reclaimed.")
+        return True
+    return False
+
+
+def stop_port(port, timeout=8.0):
+    """
+    Close this project's server on <port> so the port can be reused.
+
+    Only our own servers are stopped, and only ones this user owns: anything
+    else is reported and left alone rather than killed on a shared host. SIGTERM
+    first so the server can shut its socket down cleanly, SIGKILL only if it
+    ignores that. Returns True when the port ends up free.
+    """
+    if port_is_free(port) and not port_listeners(port):
+        print(f"✅ Port {port} is already free.")
+        return True
+
+    holders = port_listeners(port)
+    targets = [h for h in holders if h["ours"] and h["pid"]]
+
+    if not targets:
+        print(f"❌ Nothing of this script's is listening on port {port}.", file=sys.stderr)
+        print(describe_port_conflict(port), file=sys.stderr)
+        return False
+
+    if _terminate_pids(targets, port, timeout):
+        print(f"✅ Port {port} is free again - you can start on it now.")
+        return True
+
+    print(f"❌ Port {port} is still busy.", file=sys.stderr)
+    print(describe_port_conflict(port), file=sys.stderr)
+    return False
+
+
+# =============================================================================
+#  Packet capture
+# =============================================================================
+# Traffic is captured by asking each VM's own QEMU process to copy every frame
+# crossing one of its virtual NICs into a .pcap ('filter-dump'). It is added and
+# removed live over QEMU's monitor, so a running lab needs no redeploy and no
+# sniffer VM.
+#
+# The obvious alternative - attaching a listener to the VDE switch that carries
+# the link - does not work: vde_switch does MAC learning, so a late-joining port
+# only ever receives broadcast. Measured on a busy link: 0 frames that way,
+# 2,070 frames via filter-dump over the same 15 seconds.
+
+_CAP_PREFIX = "vmmcap_"
+# QEMU buffers a filter-dump and only flushes it when the object is deleted, so
+# a single long capture shows nothing at all until it is stopped. A second,
+# short-lived dump on the same NIC is therefore rotated every few seconds purely
+# to feed the live packet list; the continuous one stays untouched so the file
+# offered for download has no gaps in it.
+_PRE_PREFIX = "vmmcapv_"
+
+# The builder serves every request on its own thread and runs a capture watchdog
+# alongside them, so several of them can want the same VM's monitor at once. A
+# QEMU monitor is a single conversational session - two overlapping talkers get
+# each other's replies - so calls are serialised per VM.
+_MON_LOCKS = {}
+_MON_LOCKS_GUARD = threading.Lock()
+# 'vmm monitor' shells out and costs seconds, but a running VM's monitor
+# endpoint never moves. Caching it keeps the rotate gap short; a VM that
+# restarts gets a different port, so a failed connect drops the entry and retries.
+_MON_ENDPOINTS = {}
+
+
+def _monitor_lock(vm):
+    with _MON_LOCKS_GUARD:
+        lock = _MON_LOCKS.get(vm)
+        if lock is None:
+            lock = _MON_LOCKS[vm] = threading.Lock()
+        return lock
+
+
+# Starting several captures at once means several threads asking "what is in
+# this lab?" at the same moment, and the vmm wrapper does not survive that -
+# measured, three of six concurrent 'vmm ls' calls came back empty, which reads
+# as "the lab is down". One caller does the work under the lock and the rest
+# take its answer, so the shell-outs are never stampeded.
+_LAB_CACHE = {}
+_LAB_CACHE_LOCK = threading.Lock()
+_LAB_CACHE_TTL = 8.0
+
+
+def _lab_cached(key, produce, ttl=_LAB_CACHE_TTL):
+    with _LAB_CACHE_LOCK:
+        hit = _LAB_CACHE.get(key)
+        if hit and (time.time() - hit[0]) < ttl:
+            return hit[1]
+        value = produce()
+        # An empty inventory is more likely a hiccup than the truth, and
+        # remembering it would keep the wrong answer alive for the whole TTL.
+        if value:
+            _LAB_CACHE[key] = (time.time(), value)
+        return value
+
+
+def lab_cache_clear():
+    """Forget the lab inventory - call after anything binds or unbinds VMs."""
+    with _LAB_CACHE_LOCK:
+        _LAB_CACHE.clear()
+
+
+def _monitor_endpoint(vm, refresh=False):
+    if not refresh:
+        cached = _MON_ENDPOINTS.get(vm)
+        if cached:
+            return cached
+    # 'vmm monitor' is another shell-out that comes back blank when several
+    # captures start at once. Believing it the first time reports a running VM
+    # as "not in this lab", so a blank answer is retried before it is trusted.
+    for attempt in (0, 1, 2):
+        _, out = _run_vmm(["monitor", vm], timeout=30)
+        parts = (out or "").split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            endpoint = (parts[0], int(parts[1]))
+            _MON_ENDPOINTS[vm] = endpoint
+            return endpoint
+        if attempt < 2:
+            time.sleep(0.5 * (attempt + 1))
+    _MON_ENDPOINTS.pop(vm, None)
+    raise RuntimeError(f"'{vm}' is not a running VM in this lab.")
+
+
+def _qemu_monitor(vm, *cmds, timeout=15):
+    """Run HMP commands on a VM's QEMU monitor and return the combined output.
+
+    Raises RuntimeError if the VM is not running or the monitor is unreachable.
+    """
+    import socket
+
+    with _monitor_lock(vm):
+        sock = None
+        for attempt in (0, 1):
+            host, port = _monitor_endpoint(vm, refresh=bool(attempt))
+            try:
+                sock = socket.create_connection((host, port), timeout=timeout)
+                break
+            except OSError as exc:
+                _MON_ENDPOINTS.pop(vm, None)
+                if attempt:
+                    raise RuntimeError(f"cannot reach {vm}'s QEMU monitor "
+                                       f"at {host}:{port} ({exc})") from exc
+        sock.settimeout(4)
+
+        def drain(first_wait=2.5, idle=0.35, overall=8.0):
+            """Read until the monitor goes quiet.
+
+            There is no end-of-reply marker, so the only signal is a pause. Wait
+            a while for the first byte, then treat a short gap as 'done' - a flat
+            multi-second timeout per read made every capture call take ~9s, most
+            of it spent waiting on a socket that had already said everything.
+            """
+            buf = b""
+            deadline = time.time() + overall
+            while time.time() < deadline:
+                sock.settimeout(first_wait if not buf else idle)
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+            return buf.decode("utf-8", "replace")
+
+        try:
+            drain()  # banner
+            chunks = []
+            for cmd in cmds:
+                sock.sendall((cmd + "\n").encode())
+                # The monitor echoes every keystroke, so the reply arrives with
+                # the command smeared through it ("iininfinfo..."). Everything
+                # after the last echo of the command is the real answer.
+                text = drain()
+                idx = text.rfind(cmd)
+                chunks.append(text[idx + len(cmd):] if idx >= 0 else text)
+            return "\n".join(chunks)
+        finally:
+            sock.close()
+
+
+def running_vms():
+    """Hostnames of the VMs currently running in this lab.
+
+    'vmm ls' prints tab-separated '<name>\tRunning\t<disk>\t...'. Anything that
+    does not look like that is a warning or an error the wrapper decided to
+    print, and treating it as a VM name turns a stray line into a phantom
+    device we would then try to open a QEMU monitor for.
+    """
+    return _lab_cached("running_vms", _running_vms_uncached)
+
+
+def _running_vms_uncached():
+    # Measured: six concurrent 'vmm ls' calls, three of them came back empty.
+    # An empty answer is indistinguishable from "the lab is down", which is a
+    # very confusing thing to tell someone whose lab is plainly up, so a blank
+    # result is retried once before it is believed.
+    for attempt in (0, 1):
+        _, out = _run_vmm(["ls"], timeout=60)
+        vms = []
+        for line in (out or "").splitlines():
+            fields = line.split("\t")
+            if len(fields) < 2:
+                continue
+            name, state = fields[0].strip(), fields[1].strip()
+            if not name or "/" in name or " " in name:
+                continue
+            if state.lower() not in ("running", "paused"):
+                continue
+            vms.append(name)
+        if vms or attempt:
+            return vms
+        time.sleep(0.6)
+    return []
+
+
+def vm_netdevs(vm):
+    """[(netdev, switch_id)] for every VDE link on this VM, in QEMU order."""
+    text = _qemu_monitor(vm, "info network")
+    return [(m.group(1), m.group(2)) for m in
+            re.finditer(r"(netdev\d+):.*?/vde_switches/(\d+)", text)]
+
+
+def lab_switch_owners(vms=None):
+    """{switch_id: [vm, ...]} for the whole lab, read from the QEMU cmdlines.
+
+    Cheaper and more reliable than opening a monitor session per VM, and it is
+    what turns an anonymous switch id into 'the link between A and B'.
+
+    Cached on the VM set, not just on "no argument given": callers routinely
+    pass the list they already have, and that used to skip the cache and fire
+    one 'vmm cmdline' per VM per caller. Three captures starting together made
+    that dozens of concurrent shell-outs, some of which came back empty - which
+    surfaced as "A and B are not wired together" on a lab that plainly was.
+    """
+    vms = vms if vms is not None else running_vms()
+    key = "switch_owners:" + ",".join(sorted(vms))
+    return _lab_cached(key, lambda: _switch_owners_uncached(vms))
+
+
+def _switch_owners_uncached(vms):
+    owners = {}
+    for vm in vms:
+        _, text = _run_vmm(["cmdline", vm], timeout=60)
+        for sw in re.findall(r"vde_switches/(\d+)", text or ""):
+            owners.setdefault(sw, [])
+            if vm not in owners[sw]:
+                owners[sw].append(vm)
+    return owners
+
+
+# A pair of devices is often wired together more than once, and "capture the
+# link between A and B" is then ambiguous - picking the first one silently
+# records the wrong wire. The topology names the interface, so the interface is
+# what has to be resolved, and these two lookups make that exact:
+#
+#   'vmm config_print'  interface -> bridge name   (VJUNOS_CONNECT(GE(0,0,2), br))
+#   'vmm vde'           bridge name -> switch id   ("br": /vde_switches/9723/mgt)
+#   QEMU cmdline        switch id   -> netdev      (already in lab_switch_owners)
+#
+# It needs no login to the device and does not assume netdevs are numbered in
+# interface order, which is false on any multi-FPC chassis.
+def lab_bridge_switches():
+    """{bridge_name: switch_id} for the bound lab."""
+    return _lab_cached("bridge_switches", _bridge_switches_uncached)
+
+
+def _bridge_switches_uncached():
+    _, out = _run_vmm(["vde"], timeout=60)
+    found = {}
+    for m in re.finditer(r'"([^"]+)"\s*:\s*\S*/vde_switches/(\d+)', out or ""):
+        found[m.group(1)] = m.group(2)
+    return found
+
+
+_IFACE_KIND = {"GE": "ge", "XE": "xe", "ET": "et"}
+
+
+def _iface_from_macro(macro, args):
+    """'VJUNOS_GE', '0,0,2' -> 'ge-0/0/2'; a 4th number is a channel (':0')."""
+    kind = ""
+    for token in macro.split("_"):
+        if token in _IFACE_KIND:
+            kind = _IFACE_KIND[token]
+    if not kind:
+        return ""
+    nums = [n.strip() for n in args.split(",") if n.strip()]
+    if len(nums) == 3:
+        return f"{kind}-{nums[0]}/{nums[1]}/{nums[2]}"
+    if len(nums) == 4:
+        return f"{kind}-{nums[0]}/{nums[1]}/{nums[2]}:{nums[3]}"
+    return ""
+
+
+def lab_interface_bridges():
+    """{(hostname, interface): bridge_name} for the bound lab."""
+    return _lab_cached("iface_bridges", _interface_bridges_uncached)
+
+
+def _interface_bridges_uncached():
+    _, text = _run_vmm(["config_print"], timeout=60)
+    mapping = {}
+    host = ""
+    for line in (text or "").splitlines():
+        chassis = re.search(r"#define\s+\w*CHASSIS_NAME\s+(\S+)", line)
+        if chassis:
+            host = chassis.group(1)
+            continue
+        conn = re.search(r"\w*CONNECT\(\s*([A-Za-z0-9_]+)\(([^)]*)\)\s*,\s*"
+                         r"([A-Za-z0-9_]+)\s*\)", line)
+        if conn and host:
+            iface = _iface_from_macro(conn.group(1), conn.group(2))
+            if iface:
+                mapping[(host, iface)] = conn.group(3)
+    return mapping
+
+
+def switch_for_interface(host, iface):
+    """The VDE switch id carrying <host>'s <iface>, or '' if not known."""
+    if not host or not iface:
+        return ""
+    try:
+        bridge = lab_interface_bridges().get((host, iface))
+        if not bridge:
+            return ""
+        return lab_bridge_switches().get(bridge, "")
+    except Exception:
+        return ""
+
+
+def vm_links(vm, owners=None):
+    """[{'netdev','switch','peers'}] - who is on the far end of each link."""
+    if owners is None:
+        owners = lab_switch_owners()
+    rows = []
+    for netdev, switch in vm_netdevs(vm):
+        rows.append({'netdev': netdev, 'switch': switch,
+                     'peers': [p for p in owners.get(switch, []) if p != vm]})
+    return rows
+
+
+def vms_for_host(host, running=None):
+    """Every running VM belonging to a topology hostname.
+
+    An MX is several VMs - 'R1_RE', 'R1_FPC0' - and the revenue ports live on
+    the FPCs, so a topology name can map to more than one QEMU process.
+    """
+    running = running if running is not None else running_vms()
+    exact = [v for v in running if v == host]
+    return exact or [v for v in running
+                     if v.startswith(host + "_") or v.startswith(host + "-")]
+
+
+def resolve_capture(host_a, host_b, running=None, owners=None,
+                    port_a=None, port_b=None):
+    """Find the NIC(s) to capture on for the link between two topology hosts.
+
+    Returns [{'vm','netdev','switch','peer'}]. When the interface names are
+    known the answer is exactly one entry - the wire the user actually pointed
+    at. Without them the best that can be done is "a link between these two",
+    which is ambiguous as soon as the pair is cabled together twice.
+    """
+    running = running if running is not None else running_vms()
+    a_vms = vms_for_host(host_a, running)
+    b_vms = vms_for_host(host_b, running)
+    if not a_vms or not b_vms:
+        return []
+    owners = owners if owners is not None else lab_switch_owners(running)
+
+    # Prefer the interface the topology named. Either end identifies the wire,
+    # so B's interface is tried too - and A is still the side recorded, since
+    # that is the host the caller named first.
+    want = (switch_for_interface(host_a, port_a) or
+            switch_for_interface(host_b, port_b))
+
+    found = []
+    failed = []
+    for vm in a_vms:
+        try:
+            netdevs = vm_netdevs(vm)
+        except RuntimeError as exc:
+            # Swallowing this silently reports a wiring problem that does not
+            # exist - the link is there, we just could not read the VM.
+            failed.append(f"{vm} ({exc})")
+            continue
+        for netdev, switch in netdevs:
+            if want and switch != want:
+                continue
+            peers = [p for p in owners.get(switch, []) if p != vm]
+            hit = [p for p in peers if p in b_vms]
+            if hit:
+                found.append({'vm': vm, 'netdev': netdev,
+                              'switch': switch, 'peer': hit[0]})
+    if found:
+        return found
+    if failed:
+        raise RuntimeError("could not read the interfaces of " +
+                           ", ".join(failed))
+    if want:
+        # The interface resolved to a switch but no NIC of A's sits on it, so
+        # falling back to "any link between these two" would quietly record a
+        # different wire than the one asked for.
+        return []
+    return found
+
+
+def capture_dir(vm):
+    """A directory QEMU can actually write a .pcap into.
+
+    QEMU runs as root on the compute node and NFS squashes root, so anything
+    under a home directory fails with EPERM. Each VM's log directory is
+    world-writable and reachable from every pod host, which is what is needed.
+
+    Cached: it never moves while the VM is up, and 'vmm debuglog' is another
+    shell-out that comes back blank when two captures start at the same moment.
+    """
+    return _lab_cached("capture_dir:" + vm, lambda: _capture_dir_uncached(vm))
+
+
+def _capture_dir_uncached(vm):
+    for attempt in (0, 1):
+        _, log = _run_vmm(["debuglog", vm], timeout=30)
+        for line in (log or "").splitlines():
+            line = line.strip()
+            if line.startswith("/") and "/uuids/" in line:
+                directory = os.path.dirname(line)
+                if os.path.isdir(directory):
+                    return directory
+        if not attempt:
+            time.sleep(0.6)
+    raise RuntimeError(f"no writable log directory for '{vm}'")
+
+
+def capture_active(vm):
+    """{netdev: pcap_path} for captures currently running on this VM."""
+    try:
+        text = _qemu_monitor(vm, "info qom-tree /objects")
+    except RuntimeError:
+        return {}
+    live = {}
+    for name in re.findall(_CAP_PREFIX + r"(netdev\d+)", text):
+        live[name] = ""
+    if not live:
+        return {}
+    # qom-tree lists the objects but not their properties; ask for the filename
+    # so callers can offer the file straight away after a builder restart.
+    for netdev in list(live):
+        try:
+            info = _qemu_monitor(vm, f"qom-get {_CAP_PREFIX}{netdev} file")
+        except RuntimeError:
+            continue
+        match = re.search(r'"?(/\S+\.pcap)"?', info)
+        if match:
+            live[netdev] = match.group(1)
+    return live
+
+
+def capture_start(vm, netdev, path=None, snaplen=65536):
+    """Start copying every frame on <vm> <netdev> into a .pcap. Returns the path."""
+    if path is None:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(capture_dir(vm), f"{vm}_{netdev}_{stamp}.pcap")
+    obj = _CAP_PREFIX + netdev
+    # A capture left behind by an earlier run would keep its file open and make
+    # object_add fail on the duplicate id.
+    _qemu_monitor(vm, f"object_del {obj}")
+    out = _qemu_monitor(
+        vm, f"object_add filter-dump,id={obj},netdev={netdev},"
+            f"file={path},maxlen={snaplen}")
+    if re.search(r"error|Error|Parameter|not found", out):
+        raise RuntimeError(_clean_monitor_error(out) or
+                           f"QEMU refused to capture on {vm} {netdev}")
+    return path
+
+
+def _preview_path(directory, netdev, index):
+    return os.path.join(directory, f".preview_{netdev}_{index}.pcap")
+
+
+def preview_rotate(vm, netdev, directory, index):
+    """Flush the live-preview chunk and start the next one.
+
+    Returns (lines, next_index). The swap is done in a single monitor session:
+    splitting it across two sessions leaves the NIC unwatched for as long as it
+    takes to spawn 'vmm monitor' twice, which was enough to miss most of a burst.
+    Frames arriving inside the remaining sub-second gap are still missed by the
+    preview - the continuous capture running alongside records them either way,
+    so only the on-screen list is approximate, never the downloaded file.
+    """
+    obj = _PRE_PREFIX + netdev
+    nxt = index + 1
+    cmds = []
+    if index:
+        cmds.append(f"object_del {obj}")
+    cmds.append(f"object_add filter-dump,id={obj},netdev={netdev},"
+                f"file={_preview_path(directory, netdev, nxt)},maxlen=4096")
+    try:
+        _qemu_monitor(vm, *cmds)
+    except RuntimeError:
+        return [], 0
+
+    lines = []
+    if index:
+        # The delete above already flushed and closed this chunk, and the
+        # object_add that followed it gave the write time to land.
+        current = _preview_path(directory, netdev, index)
+        lines = [l for l in _tcpdump(current).splitlines() if l.strip()]
+        try:
+            os.remove(current)
+        except OSError:
+            pass
+    return lines, nxt
+
+
+def preview_stop(vm, netdev, directory, index):
+    """Detach the preview dump and delete its leftover chunk."""
+    try:
+        _qemu_monitor(vm, f"object_del {_PRE_PREFIX}{netdev}")
+    except RuntimeError:
+        pass
+    if index:
+        try:
+            os.remove(_preview_path(directory, netdev, index))
+        except OSError:
+            pass
+
+
+def capture_stop(vm, netdev=None):
+    """Stop one capture, or every capture on this VM. Returns the netdevs stopped."""
+    targets = [netdev] if netdev else list(capture_active(vm))
+    for nd in targets:
+        try:
+            _qemu_monitor(vm, f"object_del {_CAP_PREFIX}{nd}")
+        except RuntimeError:
+            pass
+    return targets
+
+
+def _clean_monitor_error(text):
+    """Pull a human sentence out of the monitor's echo-laden reply."""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Error") or "Permission denied" in line:
+            return line
+    return ""
+
+
+def _tcpdump(path):
+    """One-line summaries of a .pcap, or '' if tcpdump cannot read it yet."""
+    _nfs_revalidate(path)
+    try:
+        p = subprocess.run(["tcpdump", "-nr", path], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True, timeout=60)
+        return p.stdout or ""
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return ""
+
+
+def _nfs_revalidate(path):
+    """Force the NFS client to re-read the directory holding <path>.
+
+    The pcap is created and grown by QEMU on a *different* host, so this host's
+    cached directory listing and file attributes can lag badly - long enough for
+    a live capture to look empty. Re-reading the directory drops that cache.
+    """
+    try:
+        os.listdir(os.path.dirname(path) or ".")
+    except OSError:
+        pass
+
+
+def capture_packets(path, offset=0, limit=400):
+    """Decode a .pcap into one-line summaries, skipping the first <offset>.
+
+    tcpdump does the dissection, so protocols show up by name (OSPF, LDP, BGP)
+    instead of as hex. Reading a file that is still being written is fine - a
+    half-written trailing packet is simply not reported yet.
+    """
+    if not os.path.exists(path):
+        _nfs_revalidate(path)
+        if not os.path.exists(path):
+            return [], offset
+    out = _tcpdump(path)
+    lines = [l for l in out.splitlines() if l.strip()]
+    fresh = lines[offset:offset + limit]
+    return fresh, offset + len(fresh)
+
+
+def capture_count(path):
+    """How many packets are in the file so far."""
+    if not os.path.exists(path):
+        return 0
+    return len([l for l in _tcpdump(path).splitlines() if l.strip()])
+
+
+# -----------------------------------------------------------------------------
+#  --capture / --capture-stop
+# -----------------------------------------------------------------------------
+def _capture_link_table(running=None):
+    """Every capturable link in the running lab, as (device, peer, netdev)."""
+    running = running or running_vms()
+    owners = lab_switch_owners(running)
+    rows = []
+    for vm in running:
+        for link in vm_links(vm, owners):
+            for peer in link['peers']:
+                rows.append((vm, peer, link['netdev']))
+    return rows
+
+
+def cli_capture_list():
+    """Print the links --capture can record."""
+    running = running_vms()
+    if not running:
+        print("❌ No VMs are running. Deploy the lab first.")
+        return 1
+    rows = _capture_link_table(running)
+    if not rows:
+        print("❌ The running VMs have no links between them.")
+        return 1
+    print("\nLinks you can capture:\n")
+    print(f"  {'device':<22} {'far end':<22} netdev")
+    print(f"  {'-'*22} {'-'*22} ------")
+    for vm, peer, netdev in rows:
+        print(f"  {vm:<22} {peer:<22} {netdev}")
+    first = rows[0]
+    print(f"\nCapture one with:\n"
+          f"  python3 {os.path.basename(sys.argv[0])} --capture {first[0]} "
+          f"--to {first[1]} --seconds 30\n")
+    return 0
+
+
+def cli_capture(device, peer, seconds, interface=None):
+    """Record one link for <seconds>, then report where the .pcap landed."""
+    if not device:
+        return cli_capture_list()
+
+    try:
+        running = running_vms()
+    except Exception as exc:
+        print(f"❌ Could not talk to VMM: {exc}")
+        return 1
+    if not running:
+        print("❌ No VMs are running. Deploy the lab first.")
+        return 1
+
+    hosts = {vm.split('_')[0] for vm in running} | set(running)
+    if device not in hosts:
+        close = difflib.get_close_matches(device, sorted(hosts), n=1, cutoff=0.6)
+        print(f"❌ '{device}' is not a device in the running lab.")
+        if close:
+            print(f"   Did you mean '{close[0]}'?")
+        print(f"   Running: {', '.join(sorted(hosts))}")
+        return 1
+
+    if not peer:
+        # One link needs no --to; several do, and guessing would be wrong.
+        mine = [r for r in _capture_link_table(running)
+                if r[0] == device or r[0].split('_')[0] == device]
+        peers = sorted({r[1].split('_')[0] for r in mine})
+        if len(peers) == 1:
+            peer = peers[0]
+            print(f"ℹ️  {device} has one link, to {peer}.")
+        elif not peers:
+            print(f"❌ {device} has no links to another device.")
+            return 1
+        else:
+            print(f"❌ {device} has several links - say which one with --to:")
+            for p in peers:
+                print(f"     --to {p}")
+            return 1
+
+    print(f"🔎 Finding the {device} ↔ {peer} link…", flush=True)
+    try:
+        targets = resolve_capture(device, peer, running, port_a=interface)
+    except Exception as exc:
+        print(f"❌ {exc}")
+        return 1
+    if not targets:
+        if interface:
+            print(f"❌ {device} {interface} is not wired to {peer} in the "
+                  f"running lab.")
+        else:
+            print(f"❌ No link between {device} and {peer} in the running lab.")
+        return 1
+
+    chosen = targets[0]
+    if len(targets) > 1:
+        # Only happens without --interface: the pair is cabled together more
+        # than once and nothing said which wire was meant.
+        print(f"ℹ️  {device} and {peer} have {len(targets)} links; "
+              f"capturing {chosen['netdev']}. Name the port with "
+              f"--interface to pick a specific one:")
+        for t in targets:
+            print(f"     {t['netdev']} -> {t['peer']}")
+
+    vm, netdev = chosen['vm'], chosen['netdev']
+    try:
+        path = capture_start(vm, netdev)
+    except Exception as exc:
+        print(f"❌ Could not start the capture: {exc}")
+        return 1
+
+    print(f"\n🎥 Capturing {vm} {netdev} ↔ {chosen['peer']} for {seconds}s…")
+    try:
+        for left in range(seconds, 0, -1):
+            print(f"\r   {left:>4}s remaining ", end="", flush=True)
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n   interrupted - closing the file.")
+    finally:
+        print("\r" + " " * 30 + "\r", end="")
+        capture_stop(vm, netdev)
+        time.sleep(0.8)   # QEMU flushes on delete; let it reach the filesystem
+
+    total = capture_count(path)
+    print(f"✅ {total} packets → {path}")
+    if total:
+        preview, _ = capture_packets(path, 0, 10)
+        for line in preview:
+            print(f"     {line}")
+        if total > len(preview):
+            print(f"     … {total - len(preview)} more")
+    else:
+        print("   The link was idle. Send some traffic (a ping between the two "
+              "devices is enough) and try again.")
+    print(f"\n   Open it with Wireshark, or read it here:\n"
+          f"     tcpdump -nr {path}\n")
+    return 0
+
+
+def cli_capture_stop(device):
+    """Detach captures left attached to a VM, or to the whole lab."""
+    try:
+        running = running_vms()
+    except Exception as exc:
+        print(f"❌ Could not talk to VMM: {exc}")
+        return 1
+    if device:
+        vms = vms_for_host(device, running)
+        if not vms:
+            print(f"❌ '{device}' is not a device in the running lab.")
+            return 1
+    else:
+        vms = running
+
+    stopped = 0
+    for vm in vms:
+        try:
+            active = capture_active(vm)
+        except Exception:
+            continue
+        for netdev in active:
+            capture_stop(vm, netdev)
+            print(f"   stopped {vm} {netdev}")
+            stopped += 1
+    print(f"✅ {stopped} capture(s) stopped." if stopped
+          else "ℹ️  No captures were running.")
+    return 0
+
+
 def scan_live(topology_file):
     """Return {hostname: {'ip': .., 'lo0': ..}} scanned live from the running
     lab ('vmm ping' for mgmt IPs, SSH for lo0). Used by the server's periodic
@@ -2656,8 +3752,7 @@ def scan_live(topology_file):
     for vm in data.get('vms', []):
         t = vm.get('type')
         host = vm['hostname']
-        vt = 'sniffer' if (t == 'server' and vm.get('disk') == 'sniffer_disk') else t
-        nodes.append({'id': host, 'type': vt,
+        nodes.append({'id': host, 'type': t,
                       'ip': ip_map.get(re_ping_name(host, t), '')})
     annotate_lo0(nodes)
     return {n['id']: {'ip': n['ip'], 'lo0': n.get('lo0', '')} for n in nodes}
@@ -2721,9 +3816,19 @@ def serve_topology_diagram(topology_file, port=8080, out_path="topology.html",
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
     except OSError as e:
-        print(f"❌ Could not start the web server on port {port}: {e}\n"
-              f"   Try a different port with --port <N>.", file=sys.stderr)
-        return
+        srv = None
+        if getattr(e, "errno", None) == errno.EADDRINUSE and reclaim_port(port):
+            try:
+                srv = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+            except OSError as e2:
+                e = e2
+        if srv is None:
+            print(f"❌ Could not start the web server on port {port}: {e}", file=sys.stderr)
+            if getattr(e, "errno", None) == errno.EADDRINUSE:
+                print(describe_port_conflict(port), file=sys.stderr)
+            else:
+                print(f"   Try a different port with --port <N>.", file=sys.stderr)
+            return
 
     ip = qpod_ip()
     ipnote = f"{hi}/{nn} devices show a mgmt IP" if hi else "no mgmt IPs yet (deploy first to show them)"
@@ -2930,7 +4035,6 @@ _TOPOLOGY_HTML = r"""<!DOCTYPE html>
 <svg id="svg">
   <style>
     .edge{stroke:#6b8296;stroke-width:1.8;fill:none}
-    .edge.sniff{stroke:#e0a33e;stroke-dasharray:7 4}
     .iflabel{font-size:10.5px;fill:#e6edf3;paint-order:stroke;stroke:#0f1720;stroke-width:3px;
              stroke-linejoin:round;text-anchor:middle}
     text{font-family:Arial,Helvetica,sans-serif}
@@ -2949,15 +4053,14 @@ _TOPOLOGY_HTML = r"""<!DOCTYPE html>
 const LAB=__LAB__, NODES=__NODES__, EDGES=__EDGES__;
 const KEY='vmm_topo_'+LAB;
 document.getElementById('lab').textContent=LAB+" — topology";
-const COLORS={server:'#c9d1d9',sniffer:'#e0a33e',vswitch:'#6cb6ff',vrouter:'#6cb6ff',
+const COLORS={server:'#c9d1d9',vswitch:'#6cb6ff',vrouter:'#6cb6ff',
  vmx:'#7ee787',vferrari:'#7ee787',vbugatti:'#7ee787',vhamilton:'#7ee787',vmaserati:'#7ee787',
  vscapa:'#f0883e',vardbeg:'#f0883e',vbowmore:'#f0883e',vbrackla:'#f0883e',valfaromeo:'#f0883e',vbalerion:'#f0883e',vqfx:'#d2a8ff'};
-function cat(t){if(t==='server')return'server';if(t==='sniffer')return'sniffer';if(t==='vswitch'||t==='vqfx')return'switch';return'router';}
+function cat(t){if(t==='server')return'server';if(t==='vswitch'||t==='vqfx')return'switch';return'router';}
 const ICON={
  router:'<circle r="8" fill="none" stroke="#0c141c" stroke-width="1.3"/><g stroke="#0c141c" stroke-width="1.2" fill="none"><path d="M0 -6V-11 M-2.2 -8.6L0 -11L2.2 -8.6"/><path d="M0 6V11 M-2.2 8.6L0 11L2.2 8.6"/><path d="M-6 0H-11 M-8.6 -2.2L-11 0L-8.6 2.2"/><path d="M6 0H11 M8.6 -2.2L11 0L8.6 2.2"/></g>',
  switch:'<rect x="-10" y="-7" width="20" height="14" rx="3" fill="none" stroke="#0c141c" stroke-width="1.3"/><g stroke="#0c141c" stroke-width="1.2" fill="none"><path d="M-6 -2H6 M3 -5L6 -2L3 1"/><path d="M6 3H-6 M-3 0L-6 3L-3 6"/></g>',
- server:'<rect x="-7" y="-10" width="14" height="20" rx="2" fill="none" stroke="#0c141c" stroke-width="1.3"/><g stroke="#0c141c" stroke-width="1.2"><path d="M-4 -6H4"/><path d="M-4 -1H4"/><path d="M-4 4H2"/></g>',
- sniffer:'<circle cx="-2" cy="-2" r="6" fill="none" stroke="#0c141c" stroke-width="1.3"/><path d="M2.5 2.5L8 8" stroke="#0c141c" stroke-width="1.8" fill="none"/>'
+ server:'<rect x="-7" y="-10" width="14" height="20" rx="2" fill="none" stroke="#0c141c" stroke-width="1.3"/><g stroke="#0c141c" stroke-width="1.2"><path d="M-4 -6H4"/><path d="M-4 -1H4"/><path d="M-4 4H2"/></g>'
 };
 const PALETTE=['#ffd24a','#ff6b6b','#4ade80','#5ac8fa','#e6edf3'];
 const NS='http://www.w3.org/2000/svg';
@@ -3013,7 +4116,7 @@ function rebuildNodes(){gN.innerHTML='';NODES.forEach(n=>{const g=nodeSvg(n);gN.
 function build(){
  EDGES.forEach(e=>{
   const hit=el('path',{fill:'none',stroke:'transparent','stroke-width':16});hit.style.cursor='grab';gE.appendChild(hit);
-  const path=el('path',{class:'edge'+(e.sniffer?' sniff':''),fill:'none'});gE.appendChild(path);
+  const path=el('path',{class:'edge',fill:'none'});gE.appendChild(path);
   const dotA=el('circle',{r:3.6,class:'port'}),dotB=el('circle',{r:3.6,class:'port'});gP.appendChild(dotA);gP.appendChild(dotB);
   const la=txt(0,0,e.ai,{class:'iflabel'});la.style.cursor='move';gL.appendChild(la);
   const lb=txt(0,0,e.bi,{class:'iflabel'});lb.style.cursor='move';gL.appendChild(lb);
@@ -3229,15 +4332,69 @@ def main():
                         help=argparse.SUPPRESS)   # internal: the foreground worker spawned by --serve
     parser.add_argument("--serve-stop", dest="serve_stop", action="store_true",
                         help="Stop the background topology web server.")
-    parser.add_argument("--port", type=int, default=8080, metavar="PORT",
-                        help="Port for --serve (default 8080).")
+    parser.add_argument("--port", type=int, default=None, metavar="PORT",
+                        help="Port for --serve (default 8080) or --build (default 8081).")
+    parser.add_argument("--servers", nargs="*", type=int, default=None, metavar="PORT",
+                        help="Is a web server running? Lists this script's builder/diagram "
+                             "servers, the port each is on, and whether it actually answers "
+                             "HTTP - a wedged server still holds its port, so 'listening' and "
+                             "'working' are reported separately. Name PORTs to check specific "
+                             "ones. Read-only: unlike --stop-port it never stops anything.")
+    parser.add_argument("--stop-port", dest="stop_port", type=int, default=None, metavar="PORT",
+                        help="Close whatever server of this script's is listening on PORT, so the "
+                             "port can be reused. Use it when --build or --serve says 'Address "
+                             "already in use' - usually a builder left running in a closed shell. "
+                             "Reports the owner and stops rather than killing anything that is not "
+                             "ours.")
     parser.add_argument("--build", action="store_true",
                         help="Start the browser-based topology BUILDER: pick devices, wire them "
                              "port-to-port by clicking, validate live against the same rules this "
                              "script enforces, then save topo.yml or deploy. Runs in the foreground.")
-    parser.add_argument("--build-port", dest="build_port", type=int, default=8081, metavar="PORT",
-                        help="Port for --build (default 8081, so it can run alongside --serve).")
+    parser.add_argument("--build-port", dest="build_port", type=int, default=None, metavar="PORT",
+                        help="Port for --build only, so a builder and a --serve diagram can run "
+                             "side by side. Overrides --port.")
+    parser.add_argument("--capture", nargs="?", const="", metavar="DEVICE",
+                        help="Capture packets on a live link without redeploying: "
+                             "--capture R1 --to R2. The frames are copied straight out of "
+                             "the running VM, so no sniffer device is needed. Writes a .pcap "
+                             "you can open in Wireshark. With no DEVICE, lists the links that "
+                             "can be captured.")
+    parser.add_argument("--to", dest="capture_to", default=None, metavar="DEVICE",
+                        help="The device at the far end of the link to capture "
+                             "(only needed with --capture when the device has several links).")
+    parser.add_argument("--seconds", dest="capture_seconds", type=int, default=30,
+                        metavar="N", help="How long --capture records for (default 30).")
+    parser.add_argument("--interface", dest="capture_iface", default=None,
+                        metavar="IFACE",
+                        help="Which port on the --capture device to record, e.g. "
+                             "ge-0/0/2. Only needed when the two devices are "
+                             "wired together more than once.")
+    parser.add_argument("--capture-stop", dest="capture_stop", nargs="?", const="",
+                        metavar="DEVICE",
+                        help="Detach any capture left running on DEVICE, or on every device "
+                             "in the lab if none is given.")
     args = parser.parse_args()
+
+    # --port applies to whichever server you asked for. --build-port is the
+    # explicit override for the builder, so the two servers can coexist.
+    serve_port = args.port if args.port is not None else 8080
+    build_port = (args.build_port if args.build_port is not None
+                  else args.port if args.port is not None else 8081)
+
+    # --- Read-only: what is serving right now (never stops anything) ---
+    if args.servers is not None:
+        sys.exit(print_server_status(args.servers or None))
+
+    # --- Free a port held by an earlier server (runs before anything binds) ---
+    if args.stop_port is not None:
+        sys.exit(0 if stop_port(args.stop_port) else 1)
+
+    # --- Packet capture on a running lab (no redeploy, no sniffer device) ---
+    if args.capture_stop is not None:
+        sys.exit(cli_capture_stop(args.capture_stop))
+    if args.capture is not None:
+        sys.exit(cli_capture(args.capture, args.capture_to,
+                             args.capture_seconds, args.capture_iface))
 
     # --- Topology builder UI (foreground; writes args.topology) ---
     if args.build:
@@ -3247,17 +4404,17 @@ def main():
             print(f"❌ Could not load the builder UI: {e}\n"
                   f"   vmm_builder.py must sit next to vmm.py.", file=sys.stderr)
             sys.exit(1)
-        sys.exit(vmm_builder.serve_builder(args.topology, args.build_port))
+        sys.exit(vmm_builder.serve_builder(args.topology, build_port))
 
     # --- Web server: decoupled from deploy, runs in the background ---
     if args.serve_stop:
         stop_topology_server()
         sys.exit(0)
     if args.serve_fg:                        # detached child process: block and serve
-        serve_topology_diagram(args.topology, args.port)
+        serve_topology_diagram(args.topology, serve_port)
         sys.exit(0)
     if args.serve or args.serve_bg:          # user-facing: launch the background server, return
-        start_topology_server_bg(args.topology, args.port)
+        start_topology_server_bg(args.topology, serve_port)
         sys.exit(0)
 
     if args.interfaces:
@@ -3315,7 +4472,6 @@ def main():
 
 
     time.sleep(5)
-    configure_sniffer_bridges(capture_mappings)
     print("\n" + "="*50)
     print(" 🔧 Phase 4: Applying Baseline Configuration")
     print("="*50) 
@@ -3399,7 +4555,7 @@ def main():
             else:
                 skipped.append((host, vtype, "no telnet console found via 'vmm serial'"))
         else:
-            # server / sniffer have no Junos baseline applied in this phase.
+            # 'server' has no Junos baseline applied in this phase.
             skipped.append((host, vtype, "no serial baseline for this type"))
 
     print(f"{len(plan)} device(s) to configure:")
